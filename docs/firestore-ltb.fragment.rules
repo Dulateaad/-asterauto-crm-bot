@@ -1,0 +1,17 @@
+// Вставьте этот фрагмент внутрь `match /databases/{database}/documents { ... }`
+// в основном файле `firestore.rules` репозитория веб-приложения (car-auction-app),
+// затем задеплойте: firebase deploy --only firestore:rules
+
+    // === CRM Telegram-бот (только Admin SDK) ===
+    match /ltbUsers/{id} {
+      allow read, write: if false;
+    }
+    match /ltbLeads/{id} {
+      allow read, write: if false;
+    }
+    match /ltbTransfers/{id} {
+      allow read, write: if false;
+    }
+    match /ltbSettings/{id} {
+      allow read, write: if false;
+    }
