@@ -100,25 +100,45 @@ function leadActionsKb(leadId: string) {
 }
 
 async function sendMain(ctx: Context, uid: number) {
-  const u = await getUser(uid);
-  if (!u) {
-    await ctx.reply('Вас нет в системе. Попросите администратора добавить вас (/adduser в боте у админа).');
-    return;
+  try {
+    let u = await getUser(uid);
+    // Первый вход: ID в BOT_ADMIN_IDS, но ещё нет документа в ltbUsers — создаём admin
+    if (!u && isAdmin(uid)) {
+      const label =
+        [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') ||
+        ctx.from?.username ||
+        'Admin';
+      await setUser(uid, label, 'admin');
+      u = await getUser(uid);
+    }
+    if (!u) {
+      await ctx.reply('Вас нет в системе. Попросите администратора добавить вас (/adduser в боте у админа).');
+      return;
+    }
+    if (u.role === 'none' || !u.active) {
+      await ctx.reply('Учетная запись не активна.');
+      return;
+    }
+    const label =
+      u.role === 'atz'
+        ? 'АТЗ'
+        : u.role === 'rop'
+          ? 'РОП'
+          : u.role === 'admin'
+            ? 'Админ / менеджер'
+            : 'Менеджер';
+    const mk = mainKb(u.role);
+    await ctx.reply(`🏠 Главное меню (${label})`, { reply_markup: mk.reply_markup });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('sendMain / Firestore:', e);
+    const grpc = e as { code?: number; details?: string };
+    const isDenied = grpc.code === 7 || String(grpc.details || '').includes('PERMISSION_DENIED');
+    const hint = isDenied
+      ? 'Доступ к Firestore запрещён (IAM). В Google Cloud Console → IAM для проекта ключа выдайте этому сервисному аккаунту роль «Cloud Datastore User» или «Editor». Убедитесь, что в Firebase для этого проекта включён Firestore, а JSON ключ скачан из того же проекта.'
+      : 'На Render проверьте FIREBASE_SERVICE_ACCOUNT_JSON (полный JSON) и что Firestore включён в Firebase Console.';
+    await ctx.reply('Не удалось связаться с базой.\n' + hint);
   }
-  if (u.role === 'none' || !u.active) {
-    await ctx.reply('Учетная запись не активна.');
-    return;
-  }
-  const label =
-    u.role === 'atz'
-      ? 'АТЗ'
-      : u.role === 'rop'
-        ? 'РОП'
-        : u.role === 'admin'
-          ? 'Админ / менеджер'
-          : 'Менеджер';
-  const mk = mainKb(u.role);
-  await ctx.reply(`🏠 Главное меню (${label})`, { reply_markup: mk.reply_markup });
 }
 
 async function runSlaBot(bot: Telegraf) {
@@ -169,10 +189,24 @@ async function main() {
   }
   const bot = new Telegraf(config.token);
 
+  bot.catch((err, ctx) => {
+    // eslint-disable-next-line no-console
+    console.error('telegraf', err);
+    void ctx?.reply?.('Ошибка бота. Проверьте логи на сервере и нажмите /start снова.');
+  });
+
   bot.start(async (ctx) => {
-    const uid = ctx.from?.id;
-    if (!uid) return;
-    await sendMain(ctx, uid);
+    try {
+      const uid = ctx.from?.id;
+      if (!uid) return;
+      await sendMain(ctx, uid);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('/start handler:', e);
+      try {
+        await ctx.reply('Ошибка при обработке /start. Смотрите логи на сервере (Render → Logs).');
+      } catch { /* */ }
+    }
   });
 
   bot.command('help', (ctx) =>
@@ -419,11 +453,43 @@ async function main() {
     runSlaBot(bot).catch(() => null);
   }, config.pollerIntervalMs);
 
-  await bot.launch();
+  const me = await bot.telegram.getMe();
   // eslint-disable-next-line no-console
-  console.log('asterauto-crm-bot started (Firebase:', config.projectId + ')');
+  console.log('Telegram:', '@' + (me.username || '?'), '| Firebase:', config.projectId);
+
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+  // На Render задан RENDER_EXTERNAL_URL — только webhook (один процесс), иначе 409 getUpdates
+  const renderPublic = process.env.RENDER_EXTERNAL_URL?.replace(/\/$/, '').trim();
+  const webhookPublic = process.env.BOT_WEBHOOK_PUBLIC_URL?.replace(/\/$/, '').trim();
+  const webhookDomain = webhookPublic || renderPublic;
+
+  if (webhookDomain) {
+    const port = Number(process.env.PORT);
+    if (!Number.isFinite(port) || port <= 0) {
+      throw new Error('Webhook: нужна переменная PORT (на Render Web Service задаётся автоматически).');
+    }
+    let secretToken = (process.env.BOT_WEBHOOK_SECRET || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 256);
+    if (secretToken.length < 8) secretToken = '';
+
+    await bot.launch({
+      dropPendingUpdates: true,
+      webhook: {
+        domain: webhookDomain,
+        port,
+        host: '0.0.0.0',
+        ...(secretToken ? { secretToken } : {}),
+      },
+    });
+    // eslint-disable-next-line no-console
+    console.log('[mode] webhook →', webhookDomain);
+  } else {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    await bot.launch({ dropPendingUpdates: true });
+    // eslint-disable-next-line no-console
+    console.log('[mode] long polling (локально). На Render нужен RENDER_EXTERNAL_URL — см. README)');
+  }
 }
 
 main().catch((e) => {

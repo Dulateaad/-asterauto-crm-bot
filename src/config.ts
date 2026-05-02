@@ -11,7 +11,7 @@ function parseIds(s: string | undefined): number[] {
 /** projectId из Firebase Console (веб авто-аукциона) */
 export const config = {
   token: process.env.TELEGRAM_BOT_TOKEN || '',
-  projectId: process.env.FIREBASE_PROJECT_ID || 'asterautoauction',
+  projectId: process.env.FIREBASE_PROJECT_ID || 'asterauto-d8e74',
   adminIds: parseIds(process.env.BOT_ADMIN_IDS),
   ropIds: parseIds(process.env.ROP_TELEGRAM_IDS),
   slaReminderMinutes: Math.max(1, parseInt(process.env.SLA_REMINDER_MINUTES || '15', 10)),

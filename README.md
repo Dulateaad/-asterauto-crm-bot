@@ -1,6 +1,6 @@
 # asterauto-crm-bot
 
-Telegram CRM-бот для **Aster Auto**: лиды, менеджеры, АТЗ, РОП, SLA. Данные в **Firebase** проекта `asterautoauction`, коллекции с префиксом `ltb*` (не пересекаются с `cars` / `users` веба).
+Telegram CRM-бот для **Aster Auto**: лиды, менеджеры, АТЗ, РОП, SLA. Данные в **Firebase** (по умолчанию `asterauto-d8e74`), коллекции с префиксом `ltb*`.
 
 ## Стек
 
@@ -24,7 +24,9 @@ npm start
 
 | Переменная | Описание |
 |------------|----------|
-| `FIREBASE_PROJECT_ID` | `asterautoauction` |
+| `FIREBASE_PROJECT_ID` | Должен совпадать с `project_id` в JSON ключа (часто `asterauto-d8e74`) |
+| `BOT_WEBHOOK_SECRET` | Опционально: 8+ символов `A-Za-z0-9_-` для проверки webhook-заголовка |
+| `BOT_WEBHOOK_PUBLIC_URL` | Опционально: публичный HTTPS URL, если не Render (иначе берётся `RENDER_EXTERNAL_URL`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Путь к JSON ключа (например `./secrets/serviceAccount.json`) |
 | или `FIREBASE_SERVICE_ACCOUNT_JSON` | Вся JSON-строка (часто на VPS) |
 | `TELEGRAM_BOT_TOKEN` | от @BotFather |
@@ -35,9 +37,17 @@ npm start
 
 Бот ходит в Firestore **только через Admin SDK**; для клиентского веба коллекции `ltb*` должны быть закрыты. Фрагмент для вставки в полный `firestore.rules` веб-проекта: [`docs/firestore-ltb.fragment.rules`](docs/firestore-ltb.fragment.rules).
 
-## VPS
+## VPS / Render
 
-После `npm run build`: `node dist/index.js` под **PM2** или **systemd**. Рабочая директория — корень этого репозитория, `.env` или переменные в панели хостинга.
+После `npm run build`: `node dist/index.js` под **PM2**, **systemd** или **Render**.
+
+**Render:** автоматически задаются **`RENDER_EXTERNAL_URL`** и **`PORT`**. Бот включает **webhook** (Telegram шлёт обновления POST на ваш сервис) — нет `getUpdates`, поэтому нет типичной ошибки **409** из‑за второго polling.
+
+Опционально **`BOT_WEBHOOK_SECRET`** (8+ символов, только `A-Za-z0-9_-`) — проверка заголовка от Telegram.
+
+**Firestore `PERMISSION_DENIED` (код 7):** [Google Cloud Console](https://console.cloud.google.com) → проект из JSON ключа → **IAM** → сервисному аккаунту добавьте **Cloud Datastore User** или **Editor**. В Firebase для проекта должен быть создан **Firestore**.
+
+**Локально** (`npm run dev`): `RENDER_EXTERNAL_URL` нет — используется **long polling**; не запускайте параллельно второй процесс с тем же токеном (Render + локально).
 
 ## Отдельный Git-репозиторий
 
