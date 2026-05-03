@@ -38,6 +38,12 @@ export function initFirebase(): void {
   console.log('[firebase] Firestore project:', admin.app().options.projectId);
 }
 
+/** Реальный projectId после init (из ключа или env), не «сырой» config.projectId */
+export function getActiveFirebaseProjectId(): string {
+  initFirebase();
+  return String(admin.app().options.projectId ?? '');
+}
+
 export function getDb() {
   initFirebase();
   return admin.firestore();

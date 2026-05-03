@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import { config } from './config';
-import { initFirebase } from './firebase';
+import { initFirebase, getActiveFirebaseProjectId } from './firebase';
 import { Telegraf, type Context } from 'telegraf';
 import { Timestamp } from 'firebase-admin/firestore';
 import { getUser, isAdmin, ropTelegramIdsFromEnv, setUser, getNextManagerTelegramId } from './services/ltbUsers';
@@ -180,6 +180,27 @@ function parseRole(s: string): UserRole | null {
   if (m === 'rop' || m === 'роп') return 'rop';
   if (m === 'admin' || m === 'админ') return 'admin';
   return null;
+}
+
+/** Публичный HTTPS для webhook. У Background Worker на Render нет URL — только Web Service или BOT_WEBHOOK_PUBLIC_URL. */
+function resolveWebhookPublicBase(): string | undefined {
+  const manual = process.env.BOT_WEBHOOK_PUBLIC_URL?.replace(/\/$/, '').trim();
+  if (manual) return manual;
+
+  const ext = process.env.RENDER_EXTERNAL_URL?.replace(/\/$/, '').trim();
+  if (ext) return ext;
+
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME?.trim();
+  if (host) return `https://${host}`;
+
+  const svcType = process.env.RENDER_SERVICE_TYPE?.trim();
+  // У web / private service иногда только имя; URL вида https://<name>.onrender.com
+  if (process.env.RENDER === 'true' && (svcType === 'web' || svcType === 'pserv')) {
+    const name = process.env.RENDER_SERVICE_NAME?.trim();
+    if (name) return `https://${name}.onrender.com`;
+  }
+
+  return undefined;
 }
 
 async function main() {
@@ -455,15 +476,20 @@ async function main() {
 
   const me = await bot.telegram.getMe();
   // eslint-disable-next-line no-console
-  console.log('Telegram:', '@' + (me.username || '?'), '| Firebase:', config.projectId);
+  console.log('Telegram:', '@' + (me.username || '?'), '| Firebase:', getActiveFirebaseProjectId());
 
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-  // На Render задан RENDER_EXTERNAL_URL — только webhook (один процесс), иначе 409 getUpdates
-  const renderPublic = process.env.RENDER_EXTERNAL_URL?.replace(/\/$/, '').trim();
-  const webhookPublic = process.env.BOT_WEBHOOK_PUBLIC_URL?.replace(/\/$/, '').trim();
-  const webhookDomain = webhookPublic || renderPublic;
+  const webhookDomain = resolveWebhookPublicBase();
+
+  if (process.env.RENDER === 'true' && !webhookDomain) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[render] Нет публичного URL для webhook (пусты RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME). ' +
+        'Создайте сервис типа Web Service (не Background Worker) или задайте BOT_WEBHOOK_PUBLIC_URL=https://ваш-сервис.onrender.com',
+    );
+  }
 
   if (webhookDomain) {
     const port = Number(process.env.PORT);
@@ -488,7 +514,7 @@ async function main() {
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     await bot.launch({ dropPendingUpdates: true });
     // eslint-disable-next-line no-console
-    console.log('[mode] long polling (локально). На Render нужен RENDER_EXTERNAL_URL — см. README)');
+    console.log('[mode] long polling. Для Render без 409 нужен Web Service + webhook или переменная BOT_WEBHOOK_PUBLIC_URL.');
   }
 }
 

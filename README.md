@@ -41,10 +41,13 @@ npm start
 
 После `npm run build`: `node dist/index.js` под **PM2**, **systemd** или **Render**.
 
-**Render:** автоматически задаются **`RENDER_EXTERNAL_URL`** и **`PORT`**. Бот включает **webhook** (Telegram шлёт обновления POST на ваш сервис) — нет `getUpdates`, поэтому нет типичной ошибки **409** из‑за второго polling.
+**Render:** для webhook нужен **публичный HTTPS**. У **Web Service** Render задаёт **`RENDER_EXTERNAL_URL`** / **`RENDER_EXTERNAL_HOSTNAME`** и **`PORT`**. У **Background Worker** URL **нет** — бот пойдёт в **long polling** и легко словит **409**, если тот же токен где-то ещё активен.
+
+Что сделать: сервис типа **Web Service** (не Worker); либо вручную **`BOT_WEBHOOK_PUBLIC_URL=https://ваш-сервис.onrender.com`**. Если тип Web, но URL пустой, бот пробует `https://$RENDER_SERVICE_NAME.onrender.com`.
 
 Опционально **`BOT_WEBHOOK_SECRET`** (8+ символов, только `A-Za-z0-9_-`) — проверка заголовка от Telegram.
 
+На Render выставьте **`FIREBASE_PROJECT_ID`** так же, как **`project_id`** в JSON (например `asterauto-d8e74`), чтобы не было предупреждения в логах — на работу Firestore это уже не влияет, ключ главнее.
 **Firestore `PERMISSION_DENIED` (код 7):** [Google Cloud Console](https://console.cloud.google.com) → проект из JSON ключа → **IAM** → сервисному аккаунту добавьте **Cloud Datastore User** или **Editor**. В Firebase для проекта должен быть создан **Firestore**.
 
 **Локально** (`npm run dev`): `RENDER_EXTERNAL_URL` нет — используется **long polling**; не запускайте параллельно второй процесс с тем же токеном (Render + локально).
