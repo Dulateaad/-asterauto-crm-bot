@@ -283,9 +283,10 @@ async function main() {
 
   bot.command('help', (ctx) =>
     ctx.reply(
-      'Команды:\n/adduser <id> manager <имя>  — откроется выбор брендов кнопками\n' +
-        '/adduser <id> manager <имя> -- Changan  — сразу задать бренды текстом (кнопки не показываются)\n' +
-        '/lead_<id> — открыть карточку (в разработке)',
+      'Команды:\n/adduser <id> manager <ФИО> — выбор брендов кнопками\n' +
+        '/adduser <id> rop|atz|admin <имя> — без брендов\n' +
+        '/adduser <id> manager <имя> -- Changan — бренды текстом\n' +
+        '/lead_<id> — в разработке',
     ),
   );
 
@@ -298,8 +299,10 @@ async function main() {
     const parts = splitAdduserArgs(raw);
     if (!parts || parts.length < 3) {
       return ctx.reply(
-        'Формат: /adduser 123456789 manager Иван\n' +
-          'Или с брендами (без кнопок): /adduser 123456789 manager Иван Петров -- Changan\n' +
+        'Формат: /adduser 123456789 manager Иван Фамилия\n' +
+          '→ откроется выбор брендов (только manager).\n' +
+          'РОП/АТЗ: /adduser 123456789 rop Имя\n' +
+          'Или сразу бренды текстом: /adduser 123 manager Иван -- Changan\n' +
           `Бренды: ${KNOWN_BRANDS.join(', ')}`,
       );
     }
@@ -353,7 +356,9 @@ async function main() {
     const hint =
       role === 'manager' && brands?.length
         ? '\n\nПодсказка: чтобы в следующий раз выбрать бренды кнопками, не добавляйте в конце «-- …».'
-        : '';
+        : role !== 'manager'
+          ? '\n\nℹ️ Кнопки выбора брендов только для роли manager (очередь лидов по брендам). Для rop / atz / admin бренды не задаются — укажите manager, если нужен выбор брендов.'
+          : '';
     await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}${hint}`);
   };
 
