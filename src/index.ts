@@ -15,20 +15,11 @@ import {
   countToday,
 } from './services/ltbLeads';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
+import { KNOWN_BRANDS } from './brands';
 
 import 'dotenv/config';
 
-const BRANDS = [
-  'OMODA',
-  'JAECOO',
-  'LADA',
-  'GAC',
-  'Changan',
-  'JAC',
-  'Chery',
-  'Jetour',
-  'Б/У',
-] as const;
+const BRANDS = KNOWN_BRANDS;
 
 const sessions = new Map<number, Session>();
 
@@ -231,7 +222,11 @@ async function main() {
   });
 
   bot.command('help', (ctx) =>
-    ctx.reply('Команды:\n/adduser <telegram_id> <роль: manager|atz|rop|admin> <имя> — только BOT_ADMIN_IDS\n/lead_<id> — открыть карточку (в разработке)'),
+    ctx.reply(
+      'Команды:\n/adduser <telegram_id> <роль: manager|atz|rop|admin> <имя> [-- бренд1 бренд2 …]\n' +
+        'Пример только Changan: /adduser 1850222787 manager Omirserik Nurgali -- Changan\n' +
+        '/lead_<id> — открыть карточку (в разработке)',
+    ),
   );
 
   bot.command('adduser', async (ctx) => {
@@ -239,16 +234,31 @@ async function main() {
     if (!uid || !isAdmin(uid)) {
       return ctx.reply('Нет прав.');
     }
-    const parts = (ctx.message?.text || '').split(/\s+/).slice(1);
+    const raw = (ctx.message?.text || '').trim();
+    const parts = raw.split(/\s+/).slice(1);
     if (parts.length < 3) {
-      return ctx.reply('Формат: /adduser 123456789 manager Иван');
+      return ctx.reply(
+        'Формат: /adduser 123456789 manager Иван\n' +
+          'С брендами (лиды только по ним): /adduser 123456789 manager Иван Петров -- Changan\n' +
+          `Бренды: ${KNOWN_BRANDS.join(', ')}`,
+      );
     }
     const tg = parseInt(parts[0]!, 10);
     const role = parseRole(parts[1]!);
-    const name = parts.slice(2).join(' ');
+    const dashIdx = parts.indexOf('--');
+    let name: string;
+    let brands: string[] | undefined;
+    if (dashIdx >= 3) {
+      name = parts.slice(2, dashIdx).join(' ');
+      brands = parts.slice(dashIdx + 1).filter(Boolean);
+      if (brands.length === 0) brands = undefined;
+    } else {
+      name = parts.slice(2).join(' ');
+    }
     if (!role || Number.isNaN(tg)) return ctx.reply('Неверные данные');
-    await setUser(tg, name, role);
-    await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}`);
+    await setUser(tg, name, role, brands);
+    const bNote = brands?.length ? `\nБренды лида: ${brands.join(', ')}` : '\nБренды: все (универсальный менеджер)';
+    await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}`);
   });
 
   bot.on('callback_query', async (ctx) => {
@@ -286,7 +296,7 @@ async function main() {
         if (!u || (u.role !== 'atz' && u.role !== 'admin' && u.role !== 'manager')) {
           return ctx.editMessageText('Нет прав (нужен АТЗ, менеджер или админ).');
         }
-        const m = await getNextManagerTelegramId();
+        const m = await getNextManagerTelegramId(String(s.data.brand));
         if (!m) {
           return ctx.editMessageText('Нет менеджеров в системе. Добавьте manager через /adduser.');
         }

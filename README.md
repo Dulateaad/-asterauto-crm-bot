@@ -34,6 +34,8 @@ npm start
 | `BOT_ADMIN_IDS` | Telegram user id через запятую (доступ к `/adduser`) |
 | `ROP_TELEGRAM_IDS` | РОП для уведомлений SLA 30 мин |
 
+**Назначение лидов по бренду:** у менеджера в `ltbUsers` можно задать поле **`brands`** (массив, как в боте: `OMODA`, `Changan`, …). Лид уходит **только** в пул менеджеров с этим брендом; если таких нет — в пул **без** `brands` (универсальные). Если подходящего никого нет — бот ответит «Нет менеджеров». Добавление: `/adduser 1850222787 manager Omirserik Nurgali -- Changan`.
+
 ## Firestore rules
 
 Бот ходит в Firestore **только через Admin SDK**; для клиентского веба коллекции `ltb*` должны быть закрыты. Фрагмент для вставки в полный `firestore.rules` веб-проекта: [`docs/firestore-ltb.fragment.rules`](docs/firestore-ltb.fragment.rules).

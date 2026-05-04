@@ -113,13 +113,14 @@ export async function recordTransfer(
   target: TransferTargetId,
   comment: string
 ) {
-  const newManager = await getNextManagerTelegramId();
-  if (!newManager) {
-    throw new Error('NO_MANAGERS');
-  }
   const leadRef = db().collection(C.leads).doc(leadId);
   const leadSnap = await leadRef.get();
   if (!leadSnap.exists) throw new Error('NO_LEAD');
+  const brand = String((leadSnap.data() as LeadDoc)?.brand || '');
+  const newManager = await getNextManagerTelegramId(brand);
+  if (!newManager) {
+    throw new Error('NO_MANAGERS');
+  }
   const prev = (leadSnap.data()?.comment as string) || '';
   const transferNote = `Передача: ${reason} → ${target}. ${comment}`;
   const newComment = prev ? `${prev}\n\n${transferNote}` : transferNote;
