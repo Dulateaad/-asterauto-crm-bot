@@ -90,6 +90,54 @@ function leadActionsKb(leadId: string) {
   ]);
 }
 
+function parseBrandPickCsv(s: string): Set<number> {
+  const set = new Set<number>();
+  for (const x of s.split(',').filter(Boolean)) {
+    const i = parseInt(x, 10);
+    if (!Number.isNaN(i) && i >= 0 && i < BRANDS.length) set.add(i);
+  }
+  return set;
+}
+
+function csvFromBrandPickSet(set: Set<number>): string {
+  return Array.from(set)
+    .sort((a, b) => a - b)
+    .join(',');
+}
+
+function adminManagerBrandPrompt(tg: number, name: string, selected: Set<number>): string {
+  const sel =
+    selected.size === 0
+      ? '—'
+      : Array.from(selected)
+          .sort((a, b) => a - b)
+          .map((i) => BRANDS[i]!)
+          .join(', ');
+  return (
+    `Менеджер: ${name} (${tg})\n\n` +
+    `Выберите бренды лидов для этого менеджера (можно несколько), затем «Готово».\n` +
+    `Или «Все бренды» — универсальный пул (любые лиды).\n\n` +
+    `Сейчас выбрано: ${sel}`
+  );
+}
+
+function adminManagerBrandKb(selected: Set<number>) {
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  for (let i = 0; i < BRANDS.length; i += 3) {
+    const chunk: ReturnType<typeof Markup.button.callback>[] = [];
+    for (let j = 0; j < 3 && i + j < BRANDS.length; j++) {
+      const idx = i + j;
+      const b = BRANDS[idx]!;
+      const mark = selected.has(idx) ? '✓ ' : '';
+      chunk.push(Markup.button.callback(`${mark}${b}`, `adm_b:t:${idx}`));
+    }
+    rows.push(chunk);
+  }
+  rows.push([Markup.button.callback('✅ Готово', 'adm_b:done')]);
+  rows.push([Markup.button.callback('🌐 Все бренды (универсальный)', 'adm_b:all')]);
+  return Markup.inlineKeyboard(rows);
+}
+
 async function sendMain(ctx: Context, uid: number) {
   try {
     let u = await getUser(uid);
@@ -223,8 +271,8 @@ async function main() {
 
   bot.command('help', (ctx) =>
     ctx.reply(
-      'Команды:\n/adduser <telegram_id> <роль: manager|atz|rop|admin> <имя> [-- бренд1 бренд2 …]\n' +
-        'Пример только Changan: /adduser 1850222787 manager Omirserik Nurgali -- Changan\n' +
+      'Команды:\n/adduser <id> <роль> <имя>  — для manager без брендов в конце откроется выбор брендов\n' +
+        '/adduser <id> manager <имя> -- Changan OMODA  — сразу с брендами\n' +
         '/lead_<id> — открыть карточку (в разработке)',
     ),
   );
@@ -239,13 +287,16 @@ async function main() {
     if (parts.length < 3) {
       return ctx.reply(
         'Формат: /adduser 123456789 manager Иван\n' +
-          'С брендами (лиды только по ним): /adduser 123456789 manager Иван Петров -- Changan\n' +
+          'Или с брендами: /adduser 123456789 manager Иван Петров -- Changan\n' +
           `Бренды: ${KNOWN_BRANDS.join(', ')}`,
       );
     }
     const tg = parseInt(parts[0]!, 10);
     const role = parseRole(parts[1]!);
     const dashIdx = parts.indexOf('--');
+    if (role !== 'manager' && dashIdx >= 0) {
+      return ctx.reply('Синтаксис «-- бренд …» только для роли manager.');
+    }
     let name: string;
     let brands: string[] | undefined;
     if (dashIdx >= 3) {
@@ -256,8 +307,27 @@ async function main() {
       name = parts.slice(2).join(' ');
     }
     if (!role || Number.isNaN(tg)) return ctx.reply('Неверные данные');
+
+    if (role === 'manager' && brands === undefined) {
+      const s = sess(uid);
+      s.key = 'admin_mgr_brands';
+      s.data.pendingMgrTg = tg;
+      s.data.pendingMgrName = name;
+      s.data.adminBrandPick = '';
+      const selected = new Set<number>();
+      await ctx.reply(adminManagerBrandPrompt(tg, name, selected), {
+        reply_markup: adminManagerBrandKb(selected).reply_markup,
+      });
+      return;
+    }
+
     await setUser(tg, name, role, brands);
-    const bNote = brands?.length ? `\nБренды лида: ${brands.join(', ')}` : '\nБренды: все (универсальный менеджер)';
+    const bNote =
+      role === 'manager'
+        ? brands?.length
+          ? `\nБренды лида: ${brands.join(', ')}`
+          : '\nБренды: все (универсальный менеджер)'
+        : '';
     await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}`);
   });
 
@@ -268,6 +338,66 @@ async function main() {
     const uid = ctx.from?.id;
     if (!uid) return;
     try {
+      if (d.startsWith('adm_b:')) {
+        if (!isAdmin(uid)) {
+          await ctx.answerCbQuery('Нет прав', { show_alert: true });
+          return;
+        }
+        const s = sess(uid);
+        if (s.key !== 'admin_mgr_brands') {
+          await ctx.answerCbQuery('Сначала выполните /adduser … manager … без «--» в конце', { show_alert: true });
+          return;
+        }
+        const tg = Number(s.data.pendingMgrTg);
+        const name = String(s.data.pendingMgrName || '');
+        if (!Number.isFinite(tg) || !name) {
+          await ctx.answerCbQuery('Сессия сброшена, начните /adduser снова', { show_alert: true });
+          s.key = 'idle';
+          s.data = {};
+          return;
+        }
+        const csv = String(s.data.adminBrandPick || '');
+        const selected = parseBrandPickCsv(csv);
+
+        if (d.startsWith('adm_b:t:')) {
+          const idx = parseInt(d.replace('adm_b:t:', ''), 10);
+          if (!Number.isFinite(idx) || idx < 0 || idx >= BRANDS.length) {
+            await ctx.answerCbQuery();
+            return;
+          }
+          if (selected.has(idx)) selected.delete(idx);
+          else selected.add(idx);
+          s.data.adminBrandPick = csvFromBrandPickSet(selected);
+          await ctx.answerCbQuery();
+          return ctx.editMessageText(adminManagerBrandPrompt(tg, name, selected), {
+            reply_markup: adminManagerBrandKb(selected).reply_markup,
+          });
+        }
+        if (d === 'adm_b:all') {
+          await setUser(tg, name, 'manager', []);
+          s.key = 'idle';
+          s.data = {};
+          await ctx.answerCbQuery();
+          return ctx.editMessageText(`✅ Ок. ${tg} — manager, ${name}\nБренды: все (универсальный).`);
+        }
+        if (d === 'adm_b:done') {
+          if (selected.size === 0) {
+            await ctx.answerCbQuery('Отметьте хотя бы один бренд или нажмите «Все бренды»', { show_alert: true });
+            return;
+          }
+          const list = Array.from(selected)
+            .sort((a, b) => a - b)
+            .map((i) => BRANDS[i]!);
+          await setUser(tg, name, 'manager', list);
+          s.key = 'idle';
+          s.data = {};
+          await ctx.answerCbQuery();
+          return ctx.editMessageText(`✅ Ок. ${tg} — manager, ${name}\nБренды лидов: ${list.join(', ')}`);
+        }
+        await ctx.answerCbQuery();
+        return;
+      }
+
       await ctx.answerCbQuery();
 
       if (d.startsWith('atz_br:')) {
