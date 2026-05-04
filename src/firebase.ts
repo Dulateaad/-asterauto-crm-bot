@@ -8,18 +8,28 @@ function serviceAccountProjectId(sa: admin.ServiceAccount): string | undefined {
   return raw.project_id || sa.projectId;
 }
 
+/** Убирает кавычки вокруг значения и переносы внутри base64 (часто ломает вставка в Render). */
+function normalizeFirebaseKeyB64(raw: string): string {
+  let s = raw.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s.replace(/\s+/g, '');
+}
+
 /** Raw JSON string for service account from env (Render-friendly). */
 function readServiceAccountJsonString(): string | undefined {
-  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64?.trim();
-  if (b64) {
+  const b64Raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64?.trim();
+  if (b64Raw) {
     // Частая ошибка: вставили сырой JSON в переменную «B64»
-    if (b64.startsWith('{')) {
+    if (b64Raw.trimStart().startsWith('{')) {
       throw new Error(
         '[firebase] В FIREBASE_SERVICE_ACCOUNT_JSON_B64 попал сырой JSON, а не base64. ' +
           'Либо перенесите JSON в FIREBASE_SERVICE_ACCOUNT_JSON (одна строка), либо задайте B64 так: ' +
           "`base64 serviceAccount.json | tr -d '\\n'` (macOS) или `base64 -w0 serviceAccount.json` (Linux).",
       );
     }
+    const b64 = normalizeFirebaseKeyB64(b64Raw);
     let decoded: string;
     try {
       decoded = Buffer.from(b64, 'base64').toString('utf8');
@@ -28,11 +38,27 @@ function readServiceAccountJsonString(): string | undefined {
         '[firebase] FIREBASE_SERVICE_ACCOUNT_JSON_B64: невалидный base64. Сгенерируйте: base64 serviceAccount.json | tr -d \'\\n\'',
       );
     }
-    const head = decoded.trimStart();
-    if (!head.startsWith('{')) {
+    decoded = decoded.replace(/^\uFEFF/, '').trim();
+    if (!decoded.startsWith('{')) {
+      try {
+        const alt = Buffer.from(b64, 'base64url').toString('utf8').replace(/^\uFEFF/, '').trim();
+        if (alt.startsWith('{')) {
+          decoded = alt;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (!decoded.startsWith('{')) {
+      const hint =
+        b64Raw !== b64
+          ? ' (значение было очищено от кавычек/переносов; если ошибка осталась — пересоздайте base64 с **исходного** JSON-файла ключа.)'
+          : '';
       throw new Error(
-        '[firebase] После декодирования FIREBASE_SERVICE_ACCOUNT_JSON_B64 строка не похожа на JSON (нет «{» в начале). ' +
-          'Снова закодируйте **файл** serviceAccount.json в base64, без лишних кавычек и пробелов вокруг.',
+        '[firebase] После декодирования FIREBASE_SERVICE_ACCOUNT_JSON_B64 строка не похожа на JSON (нет «{» в начале).' +
+          hint +
+          ' Частые причины: в панели Render вокруг base64 стоят **кавычки**; закодирован не тот файл; вместо файла вставлен фрагмент. ' +
+          'Проверка локально: сохраните тот же текст в tmp.b64, выполните `base64 -d tmp.b64 | head -c 1` — должен вывестись символ «{».',
       );
     }
     return decoded;
