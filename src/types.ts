@@ -38,7 +38,7 @@ export type WizardKey =
   | 'tr_comment'
   | 'note_lead'
   | 'status_lead'
-  /** Админ выбирает бренды для нового manager после /adduser без -- */
+  /** Админ выбирает бренды после /adduser без «--» (manager, rop, atz, admin) */
   | 'admin_mgr_brands';
 
 export interface Session {

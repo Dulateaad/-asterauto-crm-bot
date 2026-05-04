@@ -117,7 +117,22 @@ function csvFromBrandPickSet(set: Set<number>): string {
     .join(',');
 }
 
-function adminManagerBrandPrompt(tg: number, name: string, selected: Set<number>): string {
+function roleRuForPrompt(role: UserRole): string {
+  switch (role) {
+    case 'manager':
+      return 'Менеджер';
+    case 'rop':
+      return 'РОП';
+    case 'atz':
+      return 'АТЗ';
+    case 'admin':
+      return 'Админ';
+    default:
+      return role;
+  }
+}
+
+function adminManagerBrandPrompt(tg: number, name: string, selected: Set<number>, role: UserRole): string {
   const sel =
     selected.size === 0
       ? '—'
@@ -125,12 +140,27 @@ function adminManagerBrandPrompt(tg: number, name: string, selected: Set<number>
           .sort((a, b) => a - b)
           .map((i) => BRANDS[i]!)
           .join(', ');
+  const queueHint =
+    role === 'manager'
+      ? 'У manager эти бренды участвуют в очереди назначения лидов.'
+      : 'У РОП/АТЗ/админа бренды хранятся в профиле; в очередь лидов по-прежнему попадают только manager.';
   return (
-    `Менеджер: ${name} (${tg})\n\n` +
-    `Выберите бренды лидов для этого менеджера (можно несколько), затем «Готово».\n` +
-    `Или «Все бренды» — универсальный пул (любые лиды).\n\n` +
+    `${roleRuForPrompt(role)}: ${name} (${tg})\n\n` +
+    `Выберите бренды (можно несколько), затем «Готово».\n` +
+    `«Все бренды» — без списка брендов в профиле.\n` +
+    `${queueHint}\n\n` +
     `Сейчас выбрано: ${sel}`
   );
+}
+
+function sessionPendingUserRole(s: Session): UserRole {
+  const r = s.data.pendingRole as string | undefined;
+  if (r === 'manager' || r === 'rop' || r === 'atz' || r === 'admin') return r;
+  return 'manager';
+}
+
+function wantsBrandWizard(role: UserRole | null): boolean {
+  return role === 'manager' || role === 'rop' || role === 'atz' || role === 'admin';
 }
 
 function adminManagerBrandKb(selected: Set<number>) {
@@ -283,9 +313,8 @@ async function main() {
 
   bot.command('help', (ctx) =>
     ctx.reply(
-      'Команды:\n/adduser <id> manager <ФИО> — выбор брендов кнопками\n' +
-        '/adduser <id> rop|atz|admin <имя> — без брендов\n' +
-        '/adduser <id> manager <имя> -- Changan — бренды текстом\n' +
+      'Команды:\n/adduser <id> manager|rop|atz|admin <ФИО> — выбор брендов кнопками\n' +
+        '/adduser <id> <роль> <имя> -- Changan — бренды текстом (любая из ролей выше)\n' +
         '/lead_<id> — в разработке',
     ),
   );
@@ -299,19 +328,15 @@ async function main() {
     const parts = splitAdduserArgs(raw);
     if (!parts || parts.length < 3) {
       return ctx.reply(
-        'Формат: /adduser 123456789 manager Иван Фамилия\n' +
-          '→ откроется выбор брендов (только manager).\n' +
-          'РОП/АТЗ: /adduser 123456789 rop Имя\n' +
-          'Или сразу бренды текстом: /adduser 123 manager Иван -- Changan\n' +
+        'Формат: /adduser 123456789 rop Иван Фамилия\n' +
+          '→ откроется выбор брендов (manager, rop, atz, admin).\n' +
+          'Или сразу текстом: /adduser 123 rop Иван -- Changan OMODA\n' +
           `Бренды: ${KNOWN_BRANDS.join(', ')}`,
       );
     }
     const tg = parseInt(parts[0]!, 10);
     const role = parseRole(parts[1]!);
     const dashIdx = parts.findIndex((p, i) => i >= 2 && p === '--');
-    if (role !== 'manager' && dashIdx >= 0) {
-      return ctx.reply('Синтаксис «-- бренд …» только для роли manager.');
-    }
     let name: string;
     let brands: string[] | undefined;
     if (dashIdx >= 2) {
@@ -327,38 +352,31 @@ async function main() {
       return ctx.reply('Перед «--» должно быть имя. Пример: /adduser 123 manager Иван -- Changan');
     }
 
-    const useBrandWizard = role === 'manager' && (!brands || brands.length === 0);
+    const useBrandWizard = wantsBrandWizard(role) && (!brands || brands.length === 0);
     if (useBrandWizard) {
       if (!name) {
-        return ctx.reply('Укажите имя: /adduser <telegram_id> manager <ФИО>');
+        return ctx.reply('Укажите имя: /adduser <telegram_id> <роль> <ФИО>');
       }
       const s = sess(uid);
       s.key = 'admin_mgr_brands';
       s.data.pendingMgrTg = tg;
       s.data.pendingMgrName = name;
+      s.data.pendingRole = role;
       s.data.adminBrandPick = '';
       const selected = new Set<number>();
       // eslint-disable-next-line no-console
-      console.log('[adduser] brand wizard', { tg, name, uid });
-      await ctx.reply(adminManagerBrandPrompt(tg, name, selected), {
+      console.log('[adduser] brand wizard', { tg, name, role, uid });
+      await ctx.reply(adminManagerBrandPrompt(tg, name, selected, role), {
         reply_markup: adminManagerBrandKb(selected).reply_markup,
       });
       return;
     }
 
     await setUser(tg, name, role, brands);
-    const bNote =
-      role === 'manager' && brands?.length
-        ? `\nБренды лида: ${brands.join(', ')}`
-        : role === 'manager'
-          ? '\nБренды: все (универсальный менеджер)'
-          : '';
-    const hint =
-      role === 'manager' && brands?.length
-        ? '\n\nПодсказка: чтобы в следующий раз выбрать бренды кнопками, не добавляйте в конце «-- …».'
-        : role !== 'manager'
-          ? '\n\nℹ️ Кнопки выбора брендов только для роли manager (очередь лидов по брендам). Для rop / atz / admin бренды не задаются — укажите manager, если нужен выбор брендов.'
-          : '';
+    const bNote = brands?.length ? `\nБренды в профиле: ${brands.join(', ')}` : '';
+    const hint = brands?.length
+      ? '\n\nПодсказка: чтобы в следующий раз выбрать бренды кнопками, не добавляйте в конце «-- …».'
+      : '';
     await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}${hint}`);
   };
 
@@ -378,7 +396,9 @@ async function main() {
         }
         const s = sess(uid);
         if (s.key !== 'admin_mgr_brands') {
-          await ctx.answerCbQuery('Сначала выполните /adduser … manager … без «--» в конце', { show_alert: true });
+          await ctx.answerCbQuery('Сначала выполните /adduser … без «-- …» в конце, чтобы открыть выбор брендов', {
+            show_alert: true,
+          });
           return;
         }
         const tg = Number(s.data.pendingMgrTg);
@@ -392,6 +412,7 @@ async function main() {
         const csv = String(s.data.adminBrandPick || '');
         const selected = parseBrandPickCsv(csv);
 
+        const pr = sessionPendingUserRole(s);
         if (d.startsWith('adm_b:t:')) {
           const idx = parseInt(d.replace('adm_b:t:', ''), 10);
           if (!Number.isFinite(idx) || idx < 0 || idx >= BRANDS.length) {
@@ -402,16 +423,18 @@ async function main() {
           else selected.add(idx);
           s.data.adminBrandPick = csvFromBrandPickSet(selected);
           await ctx.answerCbQuery();
-          return ctx.editMessageText(adminManagerBrandPrompt(tg, name, selected), {
+          return ctx.editMessageText(adminManagerBrandPrompt(tg, name, selected, pr), {
             reply_markup: adminManagerBrandKb(selected).reply_markup,
           });
         }
         if (d === 'adm_b:all') {
-          await setUser(tg, name, 'manager', []);
+          await setUser(tg, name, pr, []);
           s.key = 'idle';
           s.data = {};
           await ctx.answerCbQuery();
-          return ctx.editMessageText(`✅ Ок. ${tg} — manager, ${name}\nБренды: все (универсальный).`);
+          return ctx.editMessageText(
+            `✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле не заданы (как «все» для manager).`,
+          );
         }
         if (d === 'adm_b:done') {
           if (selected.size === 0) {
@@ -421,11 +444,11 @@ async function main() {
           const list = Array.from(selected)
             .sort((a, b) => a - b)
             .map((i) => BRANDS[i]!);
-          await setUser(tg, name, 'manager', list);
+          await setUser(tg, name, pr, list);
           s.key = 'idle';
           s.data = {};
           await ctx.answerCbQuery();
-          return ctx.editMessageText(`✅ Ок. ${tg} — manager, ${name}\nБренды лидов: ${list.join(', ')}`);
+          return ctx.editMessageText(`✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле: ${list.join(', ')}`);
         }
         await ctx.answerCbQuery();
         return;
