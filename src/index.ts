@@ -13,6 +13,8 @@ import {
   recordTransfer,
   setSlaFlags,
   countToday,
+  slaClockMillis,
+  type LeadDoc,
 } from './services/ltbLeads';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS } from './brands';
@@ -196,7 +198,7 @@ async function runSlaBot(bot: Telegraf) {
   const t15 = config.slaReminderMinutes * 60 * 1000;
   const t30 = config.slaRopMinutes * 60 * 1000;
   for (const L of rows) {
-    const created = (L as { createdAt: Timestamp }).createdAt.toMillis();
+    const created = slaClockMillis(L as LeadDoc & { id: string });
     const age = now - created;
     if (age >= t15 && !(L as { sla15Sent?: boolean }).sla15Sent) {
       try {
@@ -441,18 +443,26 @@ async function main() {
         s.key = 'atz_budget';
         return ctx.editMessageText('Введите бюджет (текст или сумма):');
       }
-      if (d === 'atz_yes' || d === 'atz_no') {
+      if (d === 'atz_no') {
         const s = sess(uid);
         if (s.key !== 'atz_confirm') return;
-        if (d === 'atz_no') {
-          sess(uid).key = 'idle';
-          return ctx.editMessageText('Отмена.');
-        }
+        sess(uid).key = 'idle';
+        return ctx.editMessageText('Отмена.');
+      }
+      if (d === 'atz_yes' || d === 'atz_yes:queue' || d === 'atz_yes:self') {
+        const s = sess(uid);
+        if (s.key !== 'atz_confirm') return;
+        const keepSelf = d === 'atz_yes:self';
         const u = await getUser(uid);
         if (!u || (u.role !== 'atz' && u.role !== 'admin' && u.role !== 'manager')) {
           return ctx.editMessageText('Нет прав (нужен АТЗ, менеджер или админ).');
         }
-        const m = await getNextManagerTelegramId(String(s.data.brand));
+        let m: number | null = null;
+        if (keepSelf) {
+          m = uid;
+        } else {
+          m = await getNextManagerTelegramId(String(s.data.brand));
+        }
         if (!m) {
           return ctx.editMessageText('Нет менеджеров в системе. Добавьте manager через /adduser.');
         }
@@ -468,15 +478,26 @@ async function main() {
           m,
         );
         sess(uid).key = 'idle';
-        await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId} назначен менеджеру ${m}`);
+        const assignLabel = keepSelf ? 'закреплён за вами' : `назначен менеджеру ${m}`;
+        await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId} ${assignLabel}.`);
         const text =
           `🔔 Новый лид #${leadId}\n` +
           `ФИО: ${s.data.fio}\nТелефон: ${s.data.phone}\n` +
           `Бренд: ${s.data.brand}\nБюджет: ${s.data.budget}`;
-        try {
-          const kb = leadActionsKb(leadId);
-          await ctx.telegram.sendMessage(m, text, { reply_markup: kb.reply_markup });
-        } catch { /* */ }
+        if (m !== uid) {
+          try {
+            const kb = leadActionsKb(leadId);
+            await ctx.telegram.sendMessage(m, text, { reply_markup: kb.reply_markup });
+          } catch {
+            /* */
+          }
+        } else {
+          try {
+            await ctx.reply(text, { reply_markup: leadActionsKb(leadId).reply_markup });
+          } catch {
+            /* */
+          }
+        }
         return;
       }
 
@@ -553,12 +574,13 @@ async function main() {
       s.key = 'atz_confirm';
       {
         const confirm = Markup.inlineKeyboard([
-          [Markup.button.callback('✅ Да', 'atz_yes')],
-          [Markup.button.callback('❌ Нет', 'atz_no')],
+          [Markup.button.callback('📤 В очередь менеджерам', 'atz_yes:queue')],
+          [Markup.button.callback('👤 Оставить себе', 'atz_yes:self')],
+          [Markup.button.callback('❌ Отмена', 'atz_no')],
         ]);
         return ctx.reply(
           `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n` +
-            `Оплата: ${s.data.payment}\nБюджет: ${text}\n\nПередать менеджеру?`,
+            `Оплата: ${s.data.payment}\nБюджет: ${text}\n\nКуда отправить лид?`,
           { reply_markup: confirm.reply_markup },
         );
       }

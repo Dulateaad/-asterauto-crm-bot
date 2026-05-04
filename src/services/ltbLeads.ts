@@ -17,6 +17,8 @@ export interface LeadDoc {
   assignedTo: number;
   comment: string;
   createdAt: Timestamp;
+  /** Если нет (старые лиды) — для SLA используется createdAt */
+  lastAssignedAt?: Timestamp;
   updatedAt: Timestamp;
   firstContactAt: Timestamp | null;
   meetingAt: Timestamp | null;
@@ -27,7 +29,21 @@ export interface LeadDoc {
 }
 
 export async function createLead(
-  data: Omit<LeadDoc, 'createdAt' | 'updatedAt' | 'meetingAt' | 'lostReason' | 'sla15Sent' | 'sla30Sent' | 'transferredOutCount' | 'firstContactAt' | 'status' | 'assignedTo' | 'comment'> & { comment?: string },
+  data: Omit<
+    LeadDoc,
+    | 'createdAt'
+    | 'updatedAt'
+    | 'lastAssignedAt'
+    | 'meetingAt'
+    | 'lostReason'
+    | 'sla15Sent'
+    | 'sla30Sent'
+    | 'transferredOutCount'
+    | 'firstContactAt'
+    | 'status'
+    | 'assignedTo'
+    | 'comment'
+  > & { comment?: string },
   assignTo: number
 ): Promise<string> {
   const now = Timestamp.now();
@@ -37,6 +53,7 @@ export async function createLead(
     assignedTo: assignTo,
     comment: data.comment || '',
     createdAt: now,
+    lastAssignedAt: now,
     updatedAt: now,
     firstContactAt: null,
     meetingAt: null,
@@ -62,6 +79,12 @@ export async function listMyLeads(managerTg: number) {
     .get();
   const rows = q.docs.map((d) => ({ id: d.id, ...(d.data() as LeadDoc) }));
   return rows.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+}
+
+/** Для SLA: от последнего назначения (после передачи — новый отсчёт 15/30 мин). */
+export function slaClockMillis(L: LeadDoc & { id?: string }): number {
+  const la = (L as LeadDoc).lastAssignedAt;
+  return (la ?? L.createdAt).toMillis();
 }
 
 export async function listLeadsNeedingSla() {
@@ -129,8 +152,11 @@ export async function recordTransfer(
   batch.update(leadRef, {
     comment: newComment,
     assignedTo: newManager,
-    status: 'transferred',
+    status: 'new',
     transferredOutCount: FieldValue.increment(1),
+    lastAssignedAt: FieldValue.serverTimestamp(),
+    sla15Sent: false,
+    sla30Sent: false,
     updatedAt: FieldValue.serverTimestamp(),
   });
   const trRef = db().collection(C.transfers).doc();
