@@ -12,13 +12,30 @@ function serviceAccountProjectId(sa: admin.ServiceAccount): string | undefined {
 function readServiceAccountJsonString(): string | undefined {
   const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64?.trim();
   if (b64) {
-    try {
-      return Buffer.from(b64, 'base64').toString('utf8');
-    } catch {
+    // Частая ошибка: вставили сырой JSON в переменную «B64»
+    if (b64.startsWith('{')) {
       throw new Error(
-        '[firebase] FIREBASE_SERVICE_ACCOUNT_JSON_B64: невалидный base64. Сгенерируйте: cat serviceAccount.json | base64 | tr -d "\\n"',
+        '[firebase] В FIREBASE_SERVICE_ACCOUNT_JSON_B64 попал сырой JSON, а не base64. ' +
+          'Либо перенесите JSON в FIREBASE_SERVICE_ACCOUNT_JSON (одна строка), либо задайте B64 так: ' +
+          "`base64 serviceAccount.json | tr -d '\\n'` (macOS) или `base64 -w0 serviceAccount.json` (Linux).",
       );
     }
+    let decoded: string;
+    try {
+      decoded = Buffer.from(b64, 'base64').toString('utf8');
+    } catch {
+      throw new Error(
+        '[firebase] FIREBASE_SERVICE_ACCOUNT_JSON_B64: невалидный base64. Сгенерируйте: base64 serviceAccount.json | tr -d \'\\n\'',
+      );
+    }
+    const head = decoded.trimStart();
+    if (!head.startsWith('{')) {
+      throw new Error(
+        '[firebase] После декодирования FIREBASE_SERVICE_ACCOUNT_JSON_B64 строка не похожа на JSON (нет «{» в начале). ' +
+          'Снова закодируйте **файл** serviceAccount.json в base64, без лишних кавычек и пробелов вокруг.',
+      );
+    }
+    return decoded;
   }
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
   return raw || undefined;
@@ -53,6 +70,14 @@ function parseServiceAccountJson(jsonStr: string): admin.ServiceAccount {
 
 export function initFirebase(): void {
   if (inited) return;
+  const credSource = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64?.trim()
+    ? 'FIREBASE_SERVICE_ACCOUNT_JSON_B64'
+    : process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim()
+      ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
+      : 'application default';
+  // eslint-disable-next-line no-console
+  console.log('[firebase] credential source:', credSource);
+
   const jsonStr = readServiceAccountJsonString();
   if (jsonStr) {
     const sa = parseServiceAccountJson(jsonStr);
