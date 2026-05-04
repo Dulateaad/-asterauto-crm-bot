@@ -83,6 +83,16 @@ const TARGET: { id: TransferTargetId; label: string }[] = [
   { id: 'finance', label: 'Фин. отдел' },
 ];
 
+/** Аргументы после /adduser (любой регистр) и @botname; не совпадает с /adduser123 */
+function splitAdduserArgs(messageText: string): string[] | null {
+  const t = messageText.trim();
+  const m = t.match(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/is);
+  if (!m) return null;
+  const rest = (m[1] || '').trim();
+  if (!rest) return [];
+  return rest.split(/\s+/).filter(Boolean);
+}
+
 function leadActionsKb(leadId: string) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📞 Связался', `ld_fc:${leadId}`)],
@@ -271,50 +281,60 @@ async function main() {
 
   bot.command('help', (ctx) =>
     ctx.reply(
-      'Команды:\n/adduser <id> <роль> <имя>  — для manager без брендов в конце откроется выбор брендов\n' +
-        '/adduser <id> manager <имя> -- Changan OMODA  — сразу с брендами\n' +
+      'Команды:\n/adduser <id> manager <имя>  — откроется выбор брендов кнопками\n' +
+        '/adduser <id> manager <имя> -- Changan  — сразу задать бренды текстом (кнопки не показываются)\n' +
         '/lead_<id> — открыть карточку (в разработке)',
     ),
   );
 
-  bot.command('adduser', async (ctx) => {
+  const handleAdduser = async (ctx: Context) => {
     const uid = ctx.from?.id;
     if (!uid || !isAdmin(uid)) {
       return ctx.reply('Нет прав.');
     }
-    const raw = (ctx.message?.text || '').trim();
-    const parts = raw.split(/\s+/).slice(1);
-    if (parts.length < 3) {
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const parts = splitAdduserArgs(raw);
+    if (!parts || parts.length < 3) {
       return ctx.reply(
         'Формат: /adduser 123456789 manager Иван\n' +
-          'Или с брендами: /adduser 123456789 manager Иван Петров -- Changan\n' +
+          'Или с брендами (без кнопок): /adduser 123456789 manager Иван Петров -- Changan\n' +
           `Бренды: ${KNOWN_BRANDS.join(', ')}`,
       );
     }
     const tg = parseInt(parts[0]!, 10);
     const role = parseRole(parts[1]!);
-    const dashIdx = parts.indexOf('--');
+    const dashIdx = parts.findIndex((p, i) => i >= 2 && p === '--');
     if (role !== 'manager' && dashIdx >= 0) {
       return ctx.reply('Синтаксис «-- бренд …» только для роли manager.');
     }
     let name: string;
     let brands: string[] | undefined;
-    if (dashIdx >= 3) {
-      name = parts.slice(2, dashIdx).join(' ');
-      brands = parts.slice(dashIdx + 1).filter(Boolean);
-      if (brands.length === 0) brands = undefined;
+    if (dashIdx >= 2) {
+      name = parts.slice(2, dashIdx).join(' ').trim();
+      const after = parts.slice(dashIdx + 1).filter(Boolean);
+      brands = after.length > 0 ? after : undefined;
     } else {
-      name = parts.slice(2).join(' ');
+      name = parts.slice(2).join(' ').trim();
+      brands = undefined;
     }
     if (!role || Number.isNaN(tg)) return ctx.reply('Неверные данные');
+    if (dashIdx >= 2 && !name) {
+      return ctx.reply('Перед «--» должно быть имя. Пример: /adduser 123 manager Иван -- Changan');
+    }
 
-    if (role === 'manager' && brands === undefined) {
+    const useBrandWizard = role === 'manager' && (!brands || brands.length === 0);
+    if (useBrandWizard) {
+      if (!name) {
+        return ctx.reply('Укажите имя: /adduser <telegram_id> manager <ФИО>');
+      }
       const s = sess(uid);
       s.key = 'admin_mgr_brands';
       s.data.pendingMgrTg = tg;
       s.data.pendingMgrName = name;
       s.data.adminBrandPick = '';
       const selected = new Set<number>();
+      // eslint-disable-next-line no-console
+      console.log('[adduser] brand wizard', { tg, name, uid });
       await ctx.reply(adminManagerBrandPrompt(tg, name, selected), {
         reply_markup: adminManagerBrandKb(selected).reply_markup,
       });
@@ -323,13 +343,19 @@ async function main() {
 
     await setUser(tg, name, role, brands);
     const bNote =
-      role === 'manager'
-        ? brands?.length
-          ? `\nБренды лида: ${brands.join(', ')}`
-          : '\nБренды: все (универсальный менеджер)'
+      role === 'manager' && brands?.length
+        ? `\nБренды лида: ${brands.join(', ')}`
+        : role === 'manager'
+          ? '\nБренды: все (универсальный менеджер)'
+          : '';
+    const hint =
+      role === 'manager' && brands?.length
+        ? '\n\nПодсказка: чтобы в следующий раз выбрать бренды кнопками, не добавляйте в конце «-- …».'
         : '';
-    await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}`);
-  });
+    await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}${hint}`);
+  };
+
+  bot.hears(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/i, handleAdduser);
 
   bot.on('callback_query', async (ctx) => {
     const q = ctx.callbackQuery;
