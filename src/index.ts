@@ -420,7 +420,9 @@ async function main() {
       return;
     }
 
-    if (text === '👤 Зарегистрировать клиента' || (text === '➕ Новый клиент' && (await getUser(uid))?.role === 'manager')) {
+    // «Новый клиент» / «Зарегистрировать» — одна воронка (ФИО → телефон → …). Клавиатура с «➕» у manager и admin,
+    // но раньше срабатывало только для manager — у admin нажатие молча игнорировалось.
+    if (text === '👤 Зарегистрировать клиента' || text === '➕ Новый клиент') {
       const u = await getUser(uid);
       if (!u || (u.role !== 'atz' && u.role !== 'admin' && u.role !== 'manager')) {
         return ctx.reply('Нет прав.');
