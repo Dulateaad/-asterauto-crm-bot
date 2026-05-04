@@ -28,7 +28,8 @@ npm start
 | `BOT_WEBHOOK_SECRET` | Опционально: 8+ символов `A-Za-z0-9_-` для проверки webhook-заголовка |
 | `BOT_WEBHOOK_PUBLIC_URL` | Опционально: публичный HTTPS URL, если не Render (иначе берётся `RENDER_EXTERNAL_URL`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Путь к JSON ключа (например `./secrets/serviceAccount.json`) |
-| или `FIREBASE_SERVICE_ACCOUNT_JSON` | Вся JSON-строка (часто на VPS) |
+| или `FIREBASE_SERVICE_ACCOUNT_JSON` | Вся JSON **одной строкой** (на Render многострочная вставка часто даёт `Bad escaped character in JSON`) |
+| или `FIREBASE_SERVICE_ACCOUNT_JSON_B64` | Base64 файла ключа (одна строка): macOS `base64 serviceAccount.json \| tr -d '\n'`; Linux `base64 -w0 serviceAccount.json` — предпочтительно на Render |
 | `TELEGRAM_BOT_TOKEN` | от @BotFather |
 | `BOT_ADMIN_IDS` | Telegram user id через запятую (доступ к `/adduser`) |
 | `ROP_TELEGRAM_IDS` | РОП для уведомлений SLA 30 мин |
@@ -48,6 +49,9 @@ npm start
 Опционально **`BOT_WEBHOOK_SECRET`** (8+ символов, только `A-Za-z0-9_-`) — проверка заголовка от Telegram.
 
 На Render выставьте **`FIREBASE_PROJECT_ID`** так же, как **`project_id`** в JSON (например `asterauto-d8e74`), чтобы не было предупреждения в логах — на работу Firestore это уже не влияет, ключ главнее.
+
+**Ошибка `SyntaxError: Bad escaped character in JSON` при старте:** значение `FIREBASE_SERVICE_ACCOUNT_JSON` в панели повреждено (лишние кавычки, настоящие переносы строк внутри `private_key` вместо `\n`). Используйте **`FIREBASE_SERVICE_ACCOUNT_JSON_B64`** (одна строка base64 скачанного JSON) или вставьте JSON **в одну строку** без оборачивания всего тела в кавычки.
+
 **Firestore `PERMISSION_DENIED` (код 7):** [Google Cloud Console](https://console.cloud.google.com) → проект из JSON ключа → **IAM** → сервисному аккаунту добавьте **Cloud Datastore User** или **Editor**. В Firebase для проекта должен быть создан **Firestore**.
 
 **Локально** (`npm run dev`): `RENDER_EXTERNAL_URL` нет — используется **long polling**; не запускайте параллельно второй процесс с тем же токеном (Render + локально).

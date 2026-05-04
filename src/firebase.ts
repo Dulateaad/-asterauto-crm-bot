@@ -8,10 +8,54 @@ function serviceAccountProjectId(sa: admin.ServiceAccount): string | undefined {
   return raw.project_id || sa.projectId;
 }
 
+/** Raw JSON string for service account from env (Render-friendly). */
+function readServiceAccountJsonString(): string | undefined {
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64?.trim();
+  if (b64) {
+    try {
+      return Buffer.from(b64, 'base64').toString('utf8');
+    } catch {
+      throw new Error(
+        '[firebase] FIREBASE_SERVICE_ACCOUNT_JSON_B64: невалидный base64. Сгенерируйте: cat serviceAccount.json | base64 | tr -d "\\n"',
+      );
+    }
+  }
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  return raw || undefined;
+}
+
+function parseServiceAccountJson(jsonStr: string): admin.ServiceAccount {
+  const trimmed = jsonStr.trim();
+  const tryParse = (s: string): admin.ServiceAccount => JSON.parse(s) as admin.ServiceAccount;
+  try {
+    return tryParse(trimmed);
+  } catch (e1) {
+    // Целиком JSON в кавычках с экранированием («строка внутри строки») — частая ошибка в .env / панели
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      try {
+        const inner = JSON.parse(trimmed) as unknown;
+        if (typeof inner === 'string' && inner.trimStart().startsWith('{')) {
+          return tryParse(inner);
+        }
+      } catch {
+        // fall through
+      }
+    }
+    const msg = e1 instanceof Error ? e1.message : String(e1);
+    throw new Error(
+      `[firebase] Не удалось разобрать JSON ключа (${msg}). ` +
+        'На Render часто ломается вставка многострочного JSON. Варианты: ' +
+        '(1) FIREBASE_SERVICE_ACCOUNT_JSON_B64 = base64 всего serviceAccount.json (одна строка, надёжнее всего); ' +
+        '(2) FIREBASE_SERVICE_ACCOUNT_JSON — одна строка, без оборачивания всего значения в кавычки; в private_key только \\n, не настоящие переносы строк.',
+    );
+  }
+}
+
 export function initFirebase(): void {
   if (inited) return;
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON) as admin.ServiceAccount;
+  const jsonStr = readServiceAccountJsonString();
+  if (jsonStr) {
+    const sa = parseServiceAccountJson(jsonStr);
     const fromKey = serviceAccountProjectId(sa);
     const fromEnv = process.env.FIREBASE_PROJECT_ID?.trim();
     // Firestore Admin SDK должен ходить в тот же проект, что и ключ; иначе PERMISSION_DENIED
