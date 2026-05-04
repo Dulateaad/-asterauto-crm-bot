@@ -16,5 +16,7 @@ export const config = {
   ropIds: parseIds(process.env.ROP_TELEGRAM_IDS),
   slaReminderMinutes: Math.max(1, parseInt(process.env.SLA_REMINDER_MINUTES || '15', 10)),
   slaRopMinutes: Math.max(1, parseInt(process.env.SLA_ROP_MINUTES || '30', 10)),
+  /** Опрос покупателя после самостоятельной заявки из Telegram (минуты) */
+  customerSurveyMinutes: Math.max(1, parseInt(process.env.CUSTOMER_SURVEY_MINUTES || '15', 10)),
   pollerIntervalMs: 60_000,
 };

@@ -6,6 +6,9 @@ import { getNextManagerTelegramId } from './ltbUsers';
 
 const db = () => getDb();
 
+export type CustomerVisitRating = 'good' | 'ok' | 'bad';
+export type CustomerManagerRating = 'yes' | 'partial' | 'no';
+
 export interface LeadDoc {
   fio: string;
   phone: string;
@@ -26,6 +29,21 @@ export interface LeadDoc {
   sla15Sent: boolean;
   sla30Sent: boolean;
   transferredOutCount: number;
+  /** Заявка из Telegram от покупателя — для опроса и рассылок */
+  buyerTelegramId?: number;
+  /** Опрос «как прошло» ещё не отправлен */
+  buyerSurveyVisitPending?: boolean;
+  /** Первый вопрос опроса уже отправлен покупателю */
+  buyerSurveyVisitSent?: boolean;
+  /** Опрос завершён (все шаги или отказ) */
+  buyerSurveyComplete?: boolean;
+  buyerSurvey?: {
+    visit?: CustomerVisitRating;
+    manager?: CustomerManagerRating;
+    wantOtherBrands?: boolean;
+    otherBrands?: string[];
+    updatedAt?: Timestamp;
+  };
 }
 
 export async function createLead(
@@ -43,10 +61,16 @@ export async function createLead(
     | 'status'
     | 'assignedTo'
     | 'comment'
-  > & { comment?: string },
+    | 'buyerTelegramId'
+    | 'buyerSurveyVisitPending'
+    | 'buyerSurveyVisitSent'
+    | 'buyerSurveyComplete'
+    | 'buyerSurvey'
+  > & { comment?: string; buyerTelegramId?: number },
   assignTo: number
 ): Promise<string> {
   const now = Timestamp.now();
+  const buyerTg = data.buyerTelegramId;
   const ref = await db().collection(C.leads).add({
     ...data,
     status: 'new' as const,
@@ -61,6 +85,15 @@ export async function createLead(
     sla15Sent: false,
     sla30Sent: false,
     transferredOutCount: 0,
+    ...(buyerTg != null && Number.isFinite(buyerTg)
+      ? {
+          buyerTelegramId: buyerTg,
+          buyerSurveyVisitPending: true,
+          buyerSurveyVisitSent: false,
+          buyerSurveyComplete: false,
+          buyerSurvey: {},
+        }
+      : {}),
   } satisfies LeadDoc);
   return ref.id;
 }
@@ -182,4 +215,50 @@ export async function countToday() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
   return countLeadsSince(Timestamp.fromDate(d));
+}
+
+/** Лиды покупателей из Telegram, которым пора отправить первый вопрос опроса. */
+export async function listLeadsNeedingBuyerSurveyVisit(
+  minAgeMs: number,
+): Promise<(LeadDoc & { id: string })[]> {
+  const q = await db().collection(C.leads).where('buyerSurveyVisitPending', '==', true).limit(200).get();
+  const now = Date.now();
+  return q.docs
+    .map((d) => ({ id: d.id, ...(d.data() as LeadDoc) }))
+    .filter((L) => {
+      if (L.buyerSurveyVisitSent) return false;
+      if (L.buyerTelegramId == null || !Number.isFinite(L.buyerTelegramId)) return false;
+      return now - L.createdAt.toMillis() >= minAgeMs;
+    });
+}
+
+export async function markBuyerSurveyVisitSent(leadId: string): Promise<void> {
+  await db()
+    .collection(C.leads)
+    .doc(leadId)
+    .update({
+      buyerSurveyVisitSent: true,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+}
+
+export async function patchBuyerSurvey(
+  leadId: string,
+  patch: Partial<NonNullable<LeadDoc['buyerSurvey']>>,
+  options?: { complete?: boolean },
+): Promise<void> {
+  const ref = db().collection(C.leads).doc(leadId);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+  const cur = (snap.data()?.buyerSurvey as LeadDoc['buyerSurvey']) || {};
+  const next = { ...cur, ...patch, updatedAt: Timestamp.now() };
+  const u: Record<string, unknown> = {
+    buyerSurvey: next,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (options?.complete) {
+    u.buyerSurveyVisitPending = false;
+    u.buyerSurveyComplete = true;
+  }
+  await ref.update(u);
 }

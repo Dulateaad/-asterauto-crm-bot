@@ -7,6 +7,8 @@ export const C = {
   leads: 'ltbLeads',
   transfers: 'ltbTransfers',
   settings: 'ltbSettings',
+  /** Покупатели из Telegram: контакты и согласие на рассылки по брендам */
+  buyerContacts: 'ltbBuyerContacts',
 } as const;
 
 export const SETTINGS_DOC = 'app';

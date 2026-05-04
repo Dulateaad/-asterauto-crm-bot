@@ -8,14 +8,18 @@ import {
   createLead,
   getLead,
   listLeadsNeedingSla,
+  listLeadsNeedingBuyerSurveyVisit,
   listMyLeads,
+  markBuyerSurveyVisitSent,
   markFirstContact,
+  patchBuyerSurvey,
   recordTransfer,
   setSlaFlags,
   countToday,
   slaClockMillis,
   type LeadDoc,
 } from './services/ltbLeads';
+import { appendBrandsToBuyer, listMarketingRecipientsForBrand, upsertBuyerContact } from './services/ltbBuyerContacts';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS } from './brands';
 
@@ -67,6 +71,67 @@ function payKb() {
     [Markup.button.callback('💵 Наличные', 'atz_pay:cash')],
     [Markup.button.callback('🔁 Trade-in', 'atz_pay:tradein')],
   ]);
+}
+
+function buyPayKb() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💳 Кредит', 'buy_pay:credit')],
+    [Markup.button.callback('💵 Наличные', 'buy_pay:cash')],
+    [Markup.button.callback('🔁 Trade-in', 'buy_pay:tradein')],
+  ]);
+}
+
+function buyBrandKb() {
+  return Markup.inlineKeyboard(BRANDS.map((b) => [Markup.button.callback(b, `buy_br:${b}`)]));
+}
+
+function clientIdleKb() {
+  return Markup.keyboard([['🚗 Новая заявка на авто']]).resize();
+}
+
+function surveyVisitKb(leadId: string) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('😊 Хорошо', `cs1:${leadId}:good`),
+      Markup.button.callback('😐 Нормально', `cs1:${leadId}:ok`),
+      Markup.button.callback('☹️ Плохо', `cs1:${leadId}:bad`),
+    ],
+  ]);
+}
+
+function surveyManagerKb(leadId: string) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('👍 Да', `cs2:${leadId}:yes`),
+      Markup.button.callback('🤔 Частично', `cs2:${leadId}:partial`),
+      Markup.button.callback('👎 Нет', `cs2:${leadId}:no`),
+    ],
+  ]);
+}
+
+function surveyOtherBrandsKb(leadId: string) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ Да, интересны', `cs3:${leadId}:yes`),
+      Markup.button.callback('❌ Нет', `cs3:${leadId}:no`),
+    ],
+  ]);
+}
+
+function otherBrandsPickKb(leadId: string, selectedIdx: Set<number>) {
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  for (let i = 0; i < BRANDS.length; i += 2) {
+    const row: ReturnType<typeof Markup.button.callback>[] = [];
+    for (let j = 0; j < 2 && i + j < BRANDS.length; j++) {
+      const idx = i + j;
+      const b = BRANDS[idx]!;
+      const mark = selectedIdx.has(idx) ? '✓ ' : '';
+      row.push(Markup.button.callback(`${mark}${b}`, `cs4i:${leadId}:${idx}`));
+    }
+    rows.push(row);
+  }
+  rows.push([Markup.button.callback('✅ Готово', `cs4done:${leadId}`)]);
+  return Markup.inlineKeyboard(rows);
 }
 
 const REASON: { id: TransferReasonId; label: string }[] = [
@@ -180,6 +245,39 @@ function adminManagerBrandKb(selected: Set<number>) {
   return Markup.inlineKeyboard(rows);
 }
 
+async function sendClientEntry(ctx: Context, _uid: number) {
+  const intro =
+    'Здравствуйте! Оставьте заявку — менеджер выбранного бренда свяжется с вами.\n\n' +
+    'Нажимая «Согласен», вы разрешаете обработку контактов и получение в Telegram информационных сообщений (акции, снижение цен) по выбранным маркам.';
+  await ctx.reply(intro + '\n\nДля продолжения нажмите кнопку ниже.', {
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Согласен — заполнить заявку', 'buy_consent:yes')],
+    ]).reply_markup,
+  });
+}
+
+async function runCustomerSurveyBot(bot: Telegraf) {
+  const ms = config.customerSurveyMinutes * 60 * 1000;
+  const rows = await listLeadsNeedingBuyerSurveyVisit(ms);
+  for (const L of rows) {
+    const chat = L.buyerTelegramId;
+    if (chat == null || !Number.isFinite(chat)) continue;
+    try {
+      const kb = surveyVisitKb(L.id);
+      await bot.telegram.sendMessage(
+        chat,
+        `⏱ Прошло около ${config.customerSurveyMinutes} минут с момента заявки.\n` +
+          `Как прошло общение? (бренд: ${L.brand})\n\n` +
+          `Оцените первый контакт / консультацию.`,
+        { reply_markup: kb.reply_markup },
+      );
+      await markBuyerSurveyVisitSent(L.id);
+    } catch {
+      /* пользователь заблокировал бота и т.п. */
+    }
+  }
+}
+
 async function sendMain(ctx: Context, uid: number) {
   try {
     let u = await getUser(uid);
@@ -193,7 +291,7 @@ async function sendMain(ctx: Context, uid: number) {
       u = await getUser(uid);
     }
     if (!u) {
-      await ctx.reply('Вас нет в системе. Попросите администратора добавить вас (/adduser в боте у админа).');
+      await sendClientEntry(ctx, uid);
       return;
     }
     if (u.role === 'none' || !u.active) {
@@ -313,11 +411,44 @@ async function main() {
 
   bot.command('help', (ctx) =>
     ctx.reply(
-      'Команды:\n/adduser <id> manager|rop|atz|admin <ФИО> — выбор брендов кнопками\n' +
-        '/adduser <id> <роль> <имя> -- Changan — бренды текстом (любая из ролей выше)\n' +
+      'Покупатель: /start — заявка на авто, бренд и контакты; позже — короткий опрос и рассылки по согласию.\n\n' +
+        'Админ:\n/adduser <id> manager|rop|atz|admin <ФИО> — бренды кнопками\n' +
+        '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
+        '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
         '/lead_<id> — в разработке',
     ),
   );
+
+  const handleNotifyBrand = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !isAdmin(uid)) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/notify_brand(?:@\S+)?\s+(\S+)\s+([\s\S]+)$/i);
+    if (!m) {
+      return ctx.reply('Формат: /notify_brand OMODA Текст сообщения для клиентов');
+    }
+    const brand = m[1]!;
+    const body = m[2]!.trim();
+    if (!body) return ctx.reply('Добавьте текст после названия бренда.');
+    const ids = await listMarketingRecipientsForBrand(brand);
+    if (ids.length === 0) {
+      return ctx.reply(`Нет подписчиков с opt-in и брендом «${brand}» (или лимит выборки).`);
+    }
+    let ok = 0;
+    for (const tid of ids) {
+      try {
+        await ctx.telegram.sendMessage(tid, `📢 ${brand}\n\n${body}`);
+        ok++;
+      } catch {
+        /* */
+      }
+    }
+    return ctx.reply(`Готово: доставлено ${ok} из ${ids.length}.`);
+  };
+
+  bot.hears(/^\/notify_brand(?:@\S+)?(?:\s+(.+))?$/is, handleNotifyBrand);
 
   const handleAdduser = async (ctx: Context) => {
     const uid = ctx.from?.id;
@@ -452,6 +583,257 @@ async function main() {
         }
         await ctx.answerCbQuery();
         return;
+      }
+
+      if (d === 'buy_consent:yes') {
+        await ctx.answerCbQuery();
+        const s = sess(uid);
+        if (await getUser(uid)) {
+          return ctx.reply('Вы сотрудник — откройте меню через /start.');
+        }
+        s.key = 'buyer_fio';
+        s.data = {};
+        try {
+          return await ctx.editMessageText('Шаг 1/5. Введите **ФИО** одним сообщением в этот чат.', {
+            parse_mode: 'Markdown',
+          });
+        } catch {
+          return ctx.reply('Шаг 1/5. Введите ФИО одним сообщением:');
+        }
+      }
+
+      if (d.startsWith('buy_br:')) {
+        const s = sess(uid);
+        if (s.key !== 'buyer_brand') {
+          await ctx.answerCbQuery();
+          return;
+        }
+        s.data.brand = d.replace('buy_br:', '');
+        s.key = 'buyer_payment';
+        await ctx.answerCbQuery();
+        return ctx.editMessageText('Форма оплаты:', { reply_markup: buyPayKb().reply_markup });
+      }
+      if (d.startsWith('buy_pay:')) {
+        const s = sess(uid);
+        if (s.key !== 'buyer_payment') {
+          await ctx.answerCbQuery();
+          return;
+        }
+        const p = d.replace('buy_pay:', '') as 'credit' | 'cash' | 'tradein';
+        s.data.payment = p;
+        s.key = 'buyer_budget';
+        await ctx.answerCbQuery();
+        return ctx.editMessageText('Введите бюджет (текст или сумма) одним сообщением в чат:');
+      }
+      if (d === 'buy_no') {
+        const s = sess(uid);
+        if (s.key !== 'buyer_confirm') {
+          await ctx.answerCbQuery();
+          return;
+        }
+        s.key = 'idle';
+        s.data = {};
+        await ctx.answerCbQuery();
+        return ctx.editMessageText('Заявка отменена. Если понадобится — /start.');
+      }
+      if (d === 'buy_yes') {
+        const s = sess(uid);
+        if (s.key !== 'buyer_confirm') {
+          await ctx.answerCbQuery();
+          return;
+        }
+        if (await getUser(uid)) {
+          await ctx.answerCbQuery('Для сотрудников — кнопка «Новый клиент».', { show_alert: true });
+          return;
+        }
+        await ctx.answerCbQuery();
+        const m = await getNextManagerTelegramId(String(s.data.brand));
+        if (!m) {
+          return ctx.editMessageText('Сейчас нет доступных менеджеров по этому бренду. Попробуйте позже или позвоните в салон.');
+        }
+        const leadId = await createLead(
+          {
+            fio: String(s.data.fio),
+            phone: String(s.data.phone),
+            brand: String(s.data.brand),
+            payment: s.data.payment as 'credit' | 'cash' | 'tradein',
+            budget: String(s.data.budget),
+            createdBy: uid,
+            buyerTelegramId: uid,
+          },
+          m,
+        );
+        await upsertBuyerContact({
+          telegramId: uid,
+          fio: String(s.data.fio),
+          phone: String(s.data.phone),
+          brands: [String(s.data.brand)],
+          marketingOptIn: true,
+          lastLeadId: leadId,
+        });
+        s.key = 'idle';
+        s.data = {};
+        await ctx.editMessageText(
+          `✅ Заявка #${leadId} отправлена менеджеру по бренду ${String(s.data.brand)}.\n` +
+            `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
+        );
+        const mgrText =
+          `🔔 Новый лид #${leadId} (онлайн Telegram)\n` +
+          `ФИО: ${String(s.data.fio)}\nТелефон: ${String(s.data.phone)}\n` +
+          `Бренд: ${String(s.data.brand)}\nБюджет: ${String(s.data.budget)}`;
+        try {
+          await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
+        } catch {
+          /* */
+        }
+        try {
+          await ctx.reply('Можно оформить ещё одну заявку:', { reply_markup: clientIdleKb().reply_markup });
+        } catch {
+          /* */
+        }
+        return;
+      }
+
+      const cs1 = d.match(/^cs1:([a-zA-Z0-9]+):(good|ok|bad)$/);
+      if (cs1) {
+        await ctx.answerCbQuery();
+        const leadId = cs1[1]!;
+        const rating = cs1[2] as 'good' | 'ok' | 'bad';
+        const L = await getLead(leadId);
+        if (!L || L.buyerTelegramId !== uid) {
+          try {
+            return await ctx.editMessageText('Нет доступа к этому опросу.');
+          } catch {
+            return;
+          }
+        }
+        await patchBuyerSurvey(leadId, { visit: rating });
+        if (rating === 'bad') {
+          await patchBuyerSurvey(leadId, {}, { complete: true });
+          return ctx.editMessageText('Спасибо за откровенность. Если что-то изменится — снова /start.');
+        }
+        return ctx.editMessageText('Довольны ли общением с менеджером?', {
+          reply_markup: surveyManagerKb(leadId).reply_markup,
+        });
+      }
+
+      const cs2 = d.match(/^cs2:([a-zA-Z0-9]+):(yes|partial|no)$/);
+      if (cs2) {
+        await ctx.answerCbQuery();
+        const leadId = cs2[1]!;
+        const man = cs2[2] as 'yes' | 'partial' | 'no';
+        const L = await getLead(leadId);
+        if (!L || L.buyerTelegramId !== uid) {
+          try {
+            return await ctx.editMessageText('Нет доступа.');
+          } catch {
+            return;
+          }
+        }
+        await patchBuyerSurvey(leadId, { manager: man });
+        if (man === 'no') {
+          await patchBuyerSurvey(leadId, {}, { complete: true });
+          return ctx.editMessageText('Поняли вас. Спасибо! При необходимости — /start.');
+        }
+        return ctx.editMessageText('Хотите получать предложения и по другим брендам (в рамках этого бота)?', {
+          reply_markup: surveyOtherBrandsKb(leadId).reply_markup,
+        });
+      }
+
+      const cs3 = d.match(/^cs3:([a-zA-Z0-9]+):(yes|no)$/);
+      if (cs3) {
+        await ctx.answerCbQuery();
+        const leadId = cs3[1]!;
+        const yn = cs3[2] as 'yes' | 'no';
+        const L = await getLead(leadId);
+        if (!L || L.buyerTelegramId !== uid) {
+          try {
+            return await ctx.editMessageText('Нет доступа.');
+          } catch {
+            return;
+          }
+        }
+        if (yn === 'no') {
+          await patchBuyerSurvey(leadId, { wantOtherBrands: false }, { complete: true });
+          return ctx.editMessageText('Спасибо! Хорошего дня. Новая заявка — /start.');
+        }
+        await patchBuyerSurvey(leadId, { wantOtherBrands: true });
+        const pick = new Set<number>();
+        const s = sess(uid);
+        s.data.csPickLeadId = leadId;
+        s.data.csPickCsv = '';
+        return ctx.editMessageText('Отметьте интересующие бренды (можно несколько), затем «Готово».', {
+          reply_markup: otherBrandsPickKb(leadId, pick).reply_markup,
+        });
+      }
+
+      const cs4i = d.match(/^cs4i:([a-zA-Z0-9]+):(\d+)$/);
+      if (cs4i) {
+        await ctx.answerCbQuery();
+        const leadId = cs4i[1]!;
+        const idx = parseInt(cs4i[2]!, 10);
+        const L = await getLead(leadId);
+        if (!L || L.buyerTelegramId !== uid) {
+          try {
+            return await ctx.editMessageText('Нет доступа.');
+          } catch {
+            return;
+          }
+        }
+        if (String(sess(uid).data.csPickLeadId) !== leadId) {
+          try {
+            return await ctx.editMessageText('Сессия сбросилась. Нажмите /start.');
+          } catch {
+            return;
+          }
+        }
+        if (!Number.isFinite(idx) || idx < 0 || idx >= BRANDS.length) return;
+        const csv = String(sess(uid).data.csPickCsv || '');
+        const set = parseBrandPickCsv(csv);
+        if (set.has(idx)) set.delete(idx);
+        else set.add(idx);
+        sess(uid).data.csPickCsv = csvFromBrandPickSet(set);
+        return ctx.editMessageText('Отметьте интересующие бренды (можно несколько), затем «Готово».', {
+          reply_markup: otherBrandsPickKb(leadId, set).reply_markup,
+        });
+      }
+
+      const cs4done = d.match(/^cs4done:([a-zA-Z0-9]+)$/);
+      if (cs4done) {
+        await ctx.answerCbQuery();
+        const leadId = cs4done[1]!;
+        const L = await getLead(leadId);
+        if (!L || L.buyerTelegramId !== uid || String(sess(uid).data.csPickLeadId) !== leadId) {
+          try {
+            return await ctx.editMessageText('Нет доступа или сессия сброшена.');
+          } catch {
+            return;
+          }
+        }
+        const set = parseBrandPickCsv(String(sess(uid).data.csPickCsv || ''));
+        const extra = Array.from(set)
+          .sort((a, b) => a - b)
+          .map((i) => BRANDS[i]!)
+          .filter((b) => b !== L.brand);
+        await patchBuyerSurvey(leadId, { otherBrands: extra.length ? extra : undefined }, { complete: true });
+        if (extra.length) {
+          await appendBrandsToBuyer(uid, extra);
+          await upsertBuyerContact({
+            telegramId: uid,
+            fio: L.fio,
+            phone: L.phone,
+            brands: [L.brand, ...extra],
+            marketingOptIn: true,
+            lastLeadId: leadId,
+          });
+        }
+        sess(uid).data.csPickLeadId = undefined;
+        sess(uid).data.csPickCsv = undefined;
+        return ctx.editMessageText(
+          extra.length
+            ? `Сохранили интерес к брендам: ${extra.join(', ')}. Будем присылать акции и новости в Telegram. Спасибо!`
+            : 'Спасибо! Если передумаете по брендам — /start.',
+        );
       }
 
       await ctx.answerCbQuery();
@@ -613,6 +995,32 @@ async function main() {
         );
       }
     }
+    if (s.key === 'buyer_fio') {
+      if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
+      s.data.fio = text;
+      s.key = 'buyer_phone';
+      return ctx.reply('Шаг 2/5. Введите телефон (+7…):');
+    }
+    if (s.key === 'buyer_phone') {
+      if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
+      s.data.phone = text;
+      s.key = 'buyer_brand';
+      return ctx.reply('Шаг 3/5. Выберите бренд:', { reply_markup: buyBrandKb().reply_markup });
+    }
+    if (s.key === 'buyer_budget') {
+      if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
+      s.data.budget = text;
+      s.key = 'buyer_confirm';
+      const confirm = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Отправить заявку менеджеру', 'buy_yes')],
+        [Markup.button.callback('❌ Отмена', 'buy_no')],
+      ]);
+      return ctx.reply(
+        `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n` +
+          `Оплата: ${s.data.payment}\nБюджет: ${text}\n\nОтправить менеджеру бренда?`,
+        { reply_markup: confirm.reply_markup },
+      );
+    }
     if (s.key === 'tr_comment') {
       s.data.comment = text;
       s.key = 'idle';
@@ -646,6 +1054,11 @@ async function main() {
       s.key = 'atz_fio';
       s.data = {};
       return ctx.reply('Введите ФИО клиента:');
+    }
+    if (text === '🚗 Новая заявка на авто') {
+      const u = await getUser(uid);
+      if (u) return ctx.reply('Сотрудникам: оформление — кнопка «Новый клиент» / «Зарегистрировать».');
+      return sendClientEntry(ctx, uid);
     }
     if (text === '🔄 Передать клиента') {
       const u = await getUser(uid);
@@ -690,6 +1103,7 @@ async function main() {
 
   setInterval(() => {
     runSlaBot(bot).catch(() => null);
+    runCustomerSurveyBot(bot).catch(() => null);
   }, config.pollerIntervalMs);
 
   const me = await bot.telegram.getMe();
