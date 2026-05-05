@@ -118,6 +118,28 @@ export async function getNextManagerTelegramId(leadBrand: string): Promise<numbe
   return pick;
 }
 
+/** Те же пулы, что у автоназначения: по бренду → универсальные → все менеджеры. */
+export async function listManagersForBrandPick(leadBrand: string): Promise<LtbUserDoc[]> {
+  const brand = normalizeBrand(leadBrand);
+  const all = await listActiveManagerDocs();
+  if (all.length === 0) return [];
+  const explicit = all.filter((u) => {
+    const b = u.brands;
+    if (!b || b.length === 0) return false;
+    return b.some((x) => normalizeBrand(x) === brand);
+  });
+  const wildcard = all.filter((u) => !u.brands || u.brands.length === 0);
+  const pool = explicit.length > 0 ? explicit : wildcard.length > 0 ? wildcard : all;
+  return pool.sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10));
+}
+
+export async function formatTelegramUserLabel(telegramId: number): Promise<string> {
+  const u = await getUser(telegramId);
+  const n = u?.name?.trim();
+  if (n) return `${n} (${telegramId})`;
+  return String(telegramId);
+}
+
 export function isAdmin(telegramId: number): boolean {
   return config.adminIds.includes(telegramId);
 }

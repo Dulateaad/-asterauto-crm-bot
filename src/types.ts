@@ -37,6 +37,7 @@ export type WizardKey =
   | 'atz_payment'
   | 'atz_budget'
   | 'atz_confirm'
+  | 'atz_pick_manager'
   /** Покупатель из Telegram: согласие → те же шаги что у АТЗ */
   | 'buyer_consent'
   | 'buyer_fio'
@@ -45,6 +46,7 @@ export type WizardKey =
   | 'buyer_payment'
   | 'buyer_budget'
   | 'buyer_confirm'
+  | 'buyer_pick_manager'
   | 'tr_pick'
   | 'tr_reason'
   | 'tr_target'
