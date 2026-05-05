@@ -20,6 +20,7 @@ import {
   type LeadDoc,
 } from './services/ltbLeads';
 import { appendBrandsToBuyer, listMarketingRecipientsForBrand, upsertBuyerContact } from './services/ltbBuyerContacts';
+import { listRecentTransfers, transferReasonLabel, transferTargetLabel } from './services/ltbTransfers';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS } from './brands';
 
@@ -51,6 +52,14 @@ function mainKb(role: string) {
     ]).resize();
   }
   if (role === 'manager' || role === 'admin') {
+    if (role === 'admin') {
+      return Markup.keyboard([
+        ['➕ Новый клиент', '🔄 Передать клиента'],
+        ['📋 Мои лиды', '📊 Моя статистика'],
+        ['📤 Передачи (кто кому)', '🕓 Напоминания'],
+        ['⚙️ Помощь'],
+      ]).resize();
+    }
     return Markup.keyboard([
       ['➕ Новый клиент', '🔄 Передать клиента'],
       ['📋 Мои лиды', '📊 Моя статистика'],
@@ -73,11 +82,21 @@ function atzConfirmKb() {
   ]);
 }
 
-function atzConfirmSummary(s: Session, budgetLine: string) {
+function atzConfirmSummary(s: Session) {
   return (
-    `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n` +
-    `Оплата: ${s.data.payment}\nБюджет: ${budgetLine}\n\nКуда отправить лид?`
+    `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n\nКуда отправить лид?`
   );
+}
+
+/** Новые лиды без опроса оплаты/бюджета — технические поля для Firestore */
+const DEFAULT_LEAD_PAYMENT = 'cash' as const;
+const DEFAULT_LEAD_BUDGET = '';
+
+function leadNotifyBody(leadId: string, fio: string, phone: string, brand: string, budget: string) {
+  let t =
+    `🔔 Новый лид #${leadId}\n` + `ФИО: ${fio}\nТелефон: ${phone}\n` + `Бренд: ${brand}`;
+  if (budget.trim()) t += `\nБюджет: ${budget}`;
+  return t;
 }
 
 function buyConfirmKb() {
@@ -85,22 +104,6 @@ function buyConfirmKb() {
     [Markup.button.callback('📤 Автоочередь по бренду', 'buy_auto')],
     [Markup.button.callback('👤 Выбрать менеджера', 'buy_pick_mgr')],
     [Markup.button.callback('❌ Отмена', 'buy_no')],
-  ]);
-}
-
-function payKb() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('💳 Кредит', 'atz_pay:credit')],
-    [Markup.button.callback('💵 Наличные', 'atz_pay:cash')],
-    [Markup.button.callback('🔁 Trade-in', 'atz_pay:tradein')],
-  ]);
-}
-
-function buyPayKb() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('💳 Кредит', 'buy_pay:credit')],
-    [Markup.button.callback('💵 Наличные', 'buy_pay:cash')],
-    [Markup.button.callback('🔁 Trade-in', 'buy_pay:tradein')],
   ]);
 }
 
@@ -343,6 +346,46 @@ async function sendMain(ctx: Context, uid: number) {
   }
 }
 
+async function sendAdminTransfersReport(ctx: Context, uid: number) {
+  if (!isAdmin(uid)) {
+    await ctx.reply('Нет прав.');
+    return;
+  }
+  const rows = await listRecentTransfers(40);
+  if (rows.length === 0) {
+    await ctx.reply('Пока нет записей о передачах.');
+    return;
+  }
+  const parts: string[] = [`📤 Передачи лидов (последние ${rows.length}):`, ''];
+  for (let i = 0; i < rows.length; i++) {
+    const t = rows[i]!;
+    const [fromL, toL, leadSnap] = await Promise.all([
+      formatTelegramUserLabel(t.fromTelegramId),
+      formatTelegramUserLabel(t.toTelegramId),
+      getLead(t.leadId),
+    ]);
+    const who = leadSnap?.fio?.trim() || `лид #${t.leadId}`;
+    parts.push(
+      `${i + 1}. ${who}\n` +
+        `   От: ${fromL}\n` +
+        `   Кому: ${toL}\n` +
+        `   ${transferReasonLabel(t.reason)} → ${transferTargetLabel(t.target)}`,
+    );
+    if (t.comment.trim()) {
+      const c = t.comment.trim();
+      parts.push(`   💬 ${c.length > 140 ? `${c.slice(0, 140)}…` : c}`);
+    }
+    parts.push('');
+  }
+  const full = parts.join('\n').trim();
+  const max = 4000;
+  if (full.length <= max) {
+    await ctx.reply(full);
+    return;
+  }
+  await ctx.reply(full.slice(0, max) + '\n… (сообщение обрезано из‑за лимита Telegram; повторите /transfers)');
+}
+
 async function runSlaBot(bot: Telegraf) {
   const rows = await listLeadsNeedingSla();
   const now = Date.now();
@@ -466,9 +509,17 @@ async function main() {
         'Админ:\n/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
+        '/transfers — кто передал лид и кому (только админ)\n' +
+        'Кнопка «📤 Передачи (кто кому)» в меню админа\n' +
         '/lead_<id> — в разработке',
     ),
   );
+
+  bot.command('transfers', async (ctx) => {
+    const uid = ctx.from?.id;
+    if (!uid) return;
+    await sendAdminTransfersReport(ctx, uid);
+  });
 
   const handleNotifyBrand = async (ctx: Context) => {
     const uid = ctx.from?.id;
@@ -658,11 +709,11 @@ async function main() {
         s.key = 'buyer_fio';
         s.data = {};
         try {
-          return await ctx.editMessageText('Шаг 1/5. Введите **ФИО** одним сообщением в этот чат.', {
+          return await ctx.editMessageText('Шаг 1/3. Введите **ФИО** одним сообщением в этот чат.', {
             parse_mode: 'Markdown',
           });
         } catch {
-          return ctx.reply('Шаг 1/5. Введите ФИО одним сообщением:');
+          return ctx.reply('Шаг 1/3. Введите ФИО одним сообщением:');
         }
       }
 
@@ -673,21 +724,12 @@ async function main() {
           return;
         }
         s.data.brand = d.replace('buy_br:', '');
-        s.key = 'buyer_payment';
+        s.key = 'buyer_confirm';
         await ctx.answerCbQuery();
-        return ctx.editMessageText('Форма оплаты:', { reply_markup: buyPayKb().reply_markup });
-      }
-      if (d.startsWith('buy_pay:')) {
-        const s = sess(uid);
-        if (s.key !== 'buyer_payment') {
-          await ctx.answerCbQuery();
-          return;
-        }
-        const p = d.replace('buy_pay:', '') as 'credit' | 'cash' | 'tradein';
-        s.data.payment = p;
-        s.key = 'buyer_budget';
-        await ctx.answerCbQuery();
-        return ctx.editMessageText('Введите бюджет (текст или сумма) одним сообщением в чат:');
+        return ctx.editMessageText(
+          `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n\nКак назначить менеджера?`,
+          { reply_markup: buyConfirmKb().reply_markup },
+        );
       }
       if (d === 'buy_no') {
         const s = sess(uid);
@@ -736,10 +778,8 @@ async function main() {
         }
         await ctx.answerCbQuery();
         s.key = 'buyer_confirm';
-        const b = String(s.data.budget ?? '');
         return ctx.editMessageText(
-          `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n` +
-            `Оплата: ${s.data.payment}\nБюджет: ${b}\n\nКак назначить менеджера?`,
+          `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n\nКак назначить менеджера?`,
           { reply_markup: buyConfirmKb().reply_markup },
         );
       }
@@ -767,10 +807,16 @@ async function main() {
         const fio = String(s.data.fio);
         const phone = String(s.data.phone);
         const brand = String(s.data.brand);
-        const budget = String(s.data.budget);
-        const pay = s.data.payment as 'credit' | 'cash' | 'tradein';
         const leadId = await createLead(
-          { fio, phone, brand, payment: pay, budget, createdBy: uid, buyerTelegramId: uid },
+          {
+            fio,
+            phone,
+            brand,
+            payment: DEFAULT_LEAD_PAYMENT,
+            budget: DEFAULT_LEAD_BUDGET,
+            createdBy: uid,
+            buyerTelegramId: uid,
+          },
           m,
         );
         await upsertBuyerContact({
@@ -788,10 +834,7 @@ async function main() {
           `✅ Заявка #${leadId} отправлена.\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText =
-          `🔔 Новый лид #${leadId} (онлайн Telegram)\n` +
-          `ФИО: ${fio}\nТелефон: ${phone}\n` +
-          `Бренд: ${brand}\nБюджет: ${budget}`;
+        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET)}\n(онлайн Telegram)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -822,10 +865,16 @@ async function main() {
         const fio = String(s.data.fio);
         const phone = String(s.data.phone);
         const brand = String(s.data.brand);
-        const budget = String(s.data.budget);
-        const pay = s.data.payment as 'credit' | 'cash' | 'tradein';
         const leadId = await createLead(
-          { fio, phone, brand, payment: pay, budget, createdBy: uid, buyerTelegramId: uid },
+          {
+            fio,
+            phone,
+            brand,
+            payment: DEFAULT_LEAD_PAYMENT,
+            budget: DEFAULT_LEAD_BUDGET,
+            createdBy: uid,
+            buyerTelegramId: uid,
+          },
           m,
         );
         await upsertBuyerContact({
@@ -843,10 +892,7 @@ async function main() {
           `✅ Заявка #${leadId} отправлена (автоочередь).\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText =
-          `🔔 Новый лид #${leadId} (онлайн Telegram)\n` +
-          `ФИО: ${fio}\nТелефон: ${phone}\n` +
-          `Бренд: ${brand}\nБюджет: ${budget}`;
+        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET)}\n(онлайн Telegram)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -1008,16 +1054,8 @@ async function main() {
         const s = sess(uid);
         if (s.key !== 'atz_brand') return;
         s.data.brand = d.replace('atz_br:', '');
-        s.key = 'atz_payment';
-        return ctx.editMessageText('Форма оплаты:', { reply_markup: payKb().reply_markup });
-      }
-      if (d.startsWith('atz_pay:')) {
-        const s = sess(uid);
-        if (s.key !== 'atz_payment') return;
-        const p = d.replace('atz_pay:', '') as 'credit' | 'cash' | 'tradein';
-        s.data.payment = p;
-        s.key = 'atz_budget';
-        return ctx.editMessageText('Введите бюджет (текст или сумма):');
+        s.key = 'atz_confirm';
+        return ctx.editMessageText(atzConfirmSummary(s), { reply_markup: atzConfirmKb().reply_markup });
       }
       if (d === 'atz_no') {
         const s = sess(uid);
@@ -1055,8 +1093,7 @@ async function main() {
         const s = sess(uid);
         if (s.key !== 'atz_pick_manager') return;
         s.key = 'atz_confirm';
-        const b = String(s.data.budget ?? '');
-        return ctx.editMessageText(atzConfirmSummary(s, b), { reply_markup: atzConfirmKb().reply_markup });
+        return ctx.editMessageText(atzConfirmSummary(s), { reply_markup: atzConfirmKb().reply_markup });
       }
       const atzM = d.match(/^atz_m:(\d+)$/);
       if (atzM) {
@@ -1079,20 +1116,22 @@ async function main() {
         const fio = String(s.data.fio);
         const phone = String(s.data.phone);
         const brand = String(s.data.brand);
-        const budget = String(s.data.budget);
-        const pay = s.data.payment as 'credit' | 'cash' | 'tradein';
         const leadId = await createLead(
-          { fio, phone, brand, payment: pay, budget, createdBy: uid },
+          {
+            fio,
+            phone,
+            brand,
+            payment: DEFAULT_LEAD_PAYMENT,
+            budget: DEFAULT_LEAD_BUDGET,
+            createdBy: uid,
+          },
           m,
         );
         sess(uid).key = 'idle';
         sess(uid).data = {};
         const label = await formatTelegramUserLabel(m);
         await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}.\nОтветственный: ${label}`);
-        const text =
-          `🔔 Новый лид #${leadId}\n` +
-          `ФИО: ${fio}\nТелефон: ${phone}\n` +
-          `Бренд: ${brand}\nБюджет: ${budget}`;
+        const text = leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1129,15 +1168,13 @@ async function main() {
         const fio = String(s.data.fio);
         const phone = String(s.data.phone);
         const brand = String(s.data.brand);
-        const budget = String(s.data.budget);
-        const pay = s.data.payment as 'credit' | 'cash' | 'tradein';
         const leadId = await createLead(
           {
             fio,
             phone,
             brand,
-            payment: pay,
-            budget,
+            payment: DEFAULT_LEAD_PAYMENT,
+            budget: DEFAULT_LEAD_BUDGET,
             createdBy: uid,
           },
           m,
@@ -1147,10 +1184,7 @@ async function main() {
         const label = await formatTelegramUserLabel(m);
         const assignLabel = keepSelf ? 'закреплён за вами' : `ответственный: ${label}`;
         await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}. ${assignLabel}.`);
-        const text =
-          `🔔 Новый лид #${leadId}\n` +
-          `ФИО: ${fio}\nТелефон: ${phone}\n` +
-          `Бренд: ${brand}\nБюджет: ${budget}`;
+        const text = leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1236,32 +1270,17 @@ async function main() {
       s.key = 'atz_brand';
       return ctx.reply('Бренд — выберите кнопку:', { reply_markup: brandKb().reply_markup });
     }
-    if (s.key === 'atz_budget') {
-      s.data.budget = text;
-      s.key = 'atz_confirm';
-      return ctx.reply(atzConfirmSummary(s, text), { reply_markup: atzConfirmKb().reply_markup });
-    }
     if (s.key === 'buyer_fio') {
       if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
       s.data.fio = text;
       s.key = 'buyer_phone';
-      return ctx.reply('Шаг 2/5. Введите телефон (+7…):');
+      return ctx.reply('Шаг 2/3. Введите телефон (+7…):');
     }
     if (s.key === 'buyer_phone') {
       if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
       s.data.phone = text;
       s.key = 'buyer_brand';
-      return ctx.reply('Шаг 3/5. Выберите бренд:', { reply_markup: buyBrandKb().reply_markup });
-    }
-    if (s.key === 'buyer_budget') {
-      if (await getUser(uid)) return ctx.reply('Вы вошли как сотрудник — меню /start.');
-      s.data.budget = text;
-      s.key = 'buyer_confirm';
-      return ctx.reply(
-        `Сводка:\nФИО: ${s.data.fio}\nТел: ${s.data.phone}\nБренд: ${s.data.brand}\n` +
-          `Оплата: ${s.data.payment}\nБюджет: ${text}\n\nКак назначить менеджера?`,
-        { reply_markup: buyConfirmKb().reply_markup },
-      );
+      return ctx.reply('Шаг 3/3. Выберите бренд:', { reply_markup: buyBrandKb().reply_markup });
     }
     if (s.key === 'tr_comment') {
       s.data.comment = text;

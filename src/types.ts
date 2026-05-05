@@ -34,8 +34,6 @@ export type WizardKey =
   | 'atz_fio'
   | 'atz_phone'
   | 'atz_brand'
-  | 'atz_payment'
-  | 'atz_budget'
   | 'atz_confirm'
   | 'atz_pick_manager'
   /** Покупатель из Telegram: согласие → те же шаги что у АТЗ */
@@ -43,8 +41,6 @@ export type WizardKey =
   | 'buyer_fio'
   | 'buyer_phone'
   | 'buyer_brand'
-  | 'buyer_payment'
-  | 'buyer_budget'
   | 'buyer_confirm'
   | 'buyer_pick_manager'
   | 'tr_pick'
