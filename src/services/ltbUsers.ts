@@ -14,7 +14,7 @@ export type LtbUserDoc = {
   active: boolean;
   /**
    * Для manager: если задано и не пусто — лид только по этим брендам; иначе менеджер в пуле «на все бренды».
-   * Для rop/atz/admin: только отображение в профиле; очередь лидов (`getNextManagerTelegramId`) смотрит только manager.
+   * Для rop / atz (админ зала) / admin: только в профиле; очередь лидов (`getNextManagerTelegramId`) — только manager.
    */
   brands?: string[];
 };

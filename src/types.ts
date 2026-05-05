@@ -1,6 +1,11 @@
 import { Timestamp } from 'firebase-admin/firestore';
 
-export type UserRole = 'manager' | 'atz' | 'rop' | 'admin' | 'none';
+export type UserRole =
+  | 'manager' // менеджер продаж, очередь лидов по брендам
+  | 'atz' // АТЗ — администратор торгового зала (приём клиентов, регистрация лидов)
+  | 'rop' // руководитель отдела продаж
+  | 'admin' // админ бота / полный доступ
+  | 'none';
 
 export type LeadStatus =
   | 'new'

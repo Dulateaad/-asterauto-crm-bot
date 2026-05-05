@@ -39,13 +39,14 @@ function mainKb(role: string) {
     return Markup.keyboard([
       ['👤 Зарегистрировать клиента'],
       ['🚗 Направить в отдел', '📋 Клиенты за сегодня'],
-      ['⚠️ Ожидающие', '🏠 Главное'],
+      ['⚠️ Ожидающие клиенты', '🏠 Главное'],
     ]).resize();
   }
   if (role === 'rop') {
     return Markup.keyboard([
       ['📊 Статистика', '📋 Все лиды'],
       ['⏰ Просроченные', '👥 По менеджерам'],
+      ['🔄 Передачи', '⚙️ Настройки'],
       ['🏠 Главное'],
     ]).resize();
   }
@@ -189,7 +190,7 @@ function roleRuForPrompt(role: UserRole): string {
     case 'rop':
       return 'РОП';
     case 'atz':
-      return 'АТЗ';
+      return 'АТЗ (админ зала)';
     case 'admin':
       return 'Админ';
     default:
@@ -208,7 +209,7 @@ function adminManagerBrandPrompt(tg: number, name: string, selected: Set<number>
   const queueHint =
     role === 'manager'
       ? 'У manager эти бренды участвуют в очереди назначения лидов.'
-      : 'У РОП/АТЗ/админа бренды хранятся в профиле; в очередь лидов по-прежнему попадают только manager.';
+      : 'У РОП / АТЗ (админ зала) / админа бренды в профиле; в очередь лидов по-прежнему попадают только manager.';
   return (
     `${roleRuForPrompt(role)}: ${name} (${tg})\n\n` +
     `Выберите бренды (можно несколько), затем «Готово».\n` +
@@ -300,7 +301,7 @@ async function sendMain(ctx: Context, uid: number) {
     }
     const label =
       u.role === 'atz'
-        ? 'АТЗ'
+        ? 'АТЗ (админ зала)'
         : u.role === 'rop'
           ? 'РОП'
           : u.role === 'admin'
@@ -353,12 +354,39 @@ async function runSlaBot(bot: Telegraf) {
 }
 
 function parseRole(s: string): UserRole | null {
-  const m = s.toLowerCase();
+  const m = s.toLowerCase().trim().replace(/\s+/g, ' ');
   if (m === 'manager' || m === 'менеджер') return 'manager';
+  /** АТЗ — администратор торгового зала (приём, запись клиента) */
   if (m === 'atz' || m === 'атз') return 'atz';
+  if (
+    m === 'админ зала' ||
+    m === 'админзала' ||
+    m === 'администратор зала' ||
+    m === 'администратор торгового зала' ||
+    m === 'admin zala' ||
+    m === 'hall' ||
+    m === 'reception'
+  ) {
+    return 'atz';
+  }
   if (m === 'rop' || m === 'роп') return 'rop';
   if (m === 'admin' || m === 'админ') return 'admin';
   return null;
+}
+
+/** parts[0] = telegram id, далее роль (одно или два слова, напр. «админ зала»), затем ФИО и опционально -- бренды */
+function parseAdduserLine(parts: string[]): { tg: number; role: UserRole | null; tail: string[] } | null {
+  if (parts.length < 3) return null;
+  const tg = parseInt(parts[0]!, 10);
+  if (Number.isNaN(tg)) return null;
+  const afterId = parts.slice(1);
+  const r1 = parseRole(afterId[0]!);
+  if (r1) return { tg, role: r1, tail: afterId.slice(1) };
+  if (afterId.length >= 3) {
+    const r2 = parseRole(`${afterId[0]} ${afterId[1]}`);
+    if (r2) return { tg, role: r2, tail: afterId.slice(2) };
+  }
+  return { tg, role: null, tail: afterId.slice(1) };
 }
 
 /** Публичный HTTPS для webhook. У Background Worker на Render нет URL — только Web Service или BOT_WEBHOOK_PUBLIC_URL. */
@@ -412,7 +440,7 @@ async function main() {
   bot.command('help', (ctx) =>
     ctx.reply(
       'Покупатель: /start — заявка на авто, бренд и контакты; позже — короткий опрос и рассылки по согласию.\n\n' +
-        'Админ:\n/adduser <id> manager|rop|atz|admin <ФИО> — бренды кнопками\n' +
+        'Админ:\n/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
         '/lead_<id> — в разработке',
@@ -457,30 +485,37 @@ async function main() {
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
     const parts = splitAdduserArgs(raw);
-    if (!parts || parts.length < 3) {
+    const parsed = parts ? parseAdduserLine(parts) : null;
+    if (!parts || !parsed) {
       return ctx.reply(
         'Формат: /adduser 123456789 rop Иван Фамилия\n' +
+          'или /adduser 123456789 админ зала Иван Фамилия\n' +
           '→ откроется выбор брендов (manager, rop, atz, admin).\n' +
+          'Роль atz можно указать как: atz | атз | админ зала\n' +
           'Или сразу текстом: /adduser 123 rop Иван -- Changan OMODA\n' +
           `Бренды: ${KNOWN_BRANDS.join(', ')}`,
       );
     }
-    const tg = parseInt(parts[0]!, 10);
-    const role = parseRole(parts[1]!);
-    const dashIdx = parts.findIndex((p, i) => i >= 2 && p === '--');
+    const { tg, role, tail } = parsed;
+    if (!role) {
+      return ctx.reply(
+        'Неверная роль. Допустимо: manager | менеджер | rop | роп | atz | атз | admin | админ | админ зала',
+      );
+    }
+    const dashIdx = tail.findIndex((p, i) => i >= 1 && p === '--');
     let name: string;
     let brands: string[] | undefined;
-    if (dashIdx >= 2) {
-      name = parts.slice(2, dashIdx).join(' ').trim();
-      const after = parts.slice(dashIdx + 1).filter(Boolean);
+    if (dashIdx >= 1) {
+      name = tail.slice(0, dashIdx).join(' ').trim();
+      const after = tail.slice(dashIdx + 1).filter(Boolean);
       brands = after.length > 0 ? after : undefined;
     } else {
-      name = parts.slice(2).join(' ').trim();
+      name = tail.join(' ').trim();
       brands = undefined;
     }
-    if (!role || Number.isNaN(tg)) return ctx.reply('Неверные данные');
-    if (dashIdx >= 2 && !name) {
-      return ctx.reply('Перед «--» должно быть имя. Пример: /adduser 123 manager Иван -- Changan');
+    if (Number.isNaN(tg)) return ctx.reply('Неверные данные');
+    if (!name) {
+      return ctx.reply('Укажите ФИО после роли. Пример: /adduser 123 atz Иван Иванов');
     }
 
     const useBrandWizard = wantsBrandWizard(role) && (!brands || brands.length === 0);
@@ -497,9 +532,13 @@ async function main() {
       const selected = new Set<number>();
       // eslint-disable-next-line no-console
       console.log('[adduser] brand wizard', { tg, name, role, uid });
-      await ctx.reply(adminManagerBrandPrompt(tg, name, selected, role), {
-        reply_markup: adminManagerBrandKb(selected).reply_markup,
-      });
+      await ctx.reply(
+        adminManagerBrandPrompt(tg, name, selected, role) +
+          '\n\n⚠️ Пользователь попадёт в базу только после «Готово» или «Все бренды».',
+        {
+          reply_markup: adminManagerBrandKb(selected).reply_markup,
+        },
+      );
       return;
     }
 
@@ -511,7 +550,9 @@ async function main() {
     await ctx.reply(`Ок. Пользователь ${tg} — ${role}, ${name}${bNote}${hint}`);
   };
 
-  bot.hears(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/i, handleAdduser);
+  /** Флаг `s`: перенос строки между id и ролью — одно сообщение в Telegram */
+  bot.hears(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/is, handleAdduser);
+  bot.command('adduser', handleAdduser);
 
   bot.on('callback_query', async (ctx) => {
     const q = ctx.callbackQuery;
@@ -1092,6 +1133,31 @@ async function main() {
     }
     if (text === '📋 Клиенты за сегодня' && (await getUser(uid))?.role === 'atz') {
       return ctx.reply(`Сегодня: ${await countToday()} заявок (все ltb-лиды).`);
+    }
+    if (text === '🚗 Направить в отдел') {
+      if ((await getUser(uid))?.role !== 'atz') return;
+      return ctx.reply('Направление в отдел — в следующей версии (MVP).');
+    }
+    if (text === '⚠️ Ожидающие клиенты' || text === '⚠️ Ожидающие') {
+      if ((await getUser(uid))?.role !== 'atz') return;
+      return ctx.reply(
+        'Список ожидающих клиентов — в следующей версии. Пока используйте «Клиенты за сегодня» и лиды у менеджеров.',
+      );
+    }
+    if (text === '📋 Все лиды' || text === '⏰ Просроченные' || text === '👥 По менеджерам') {
+      if ((await getUser(uid))?.role !== 'rop') return;
+      return ctx.reply('Раздел в разработке. Краткая сводка: кнопка «📊 Статистика».');
+    }
+    if (text === '🔄 Передачи' || text === '⚙️ Настройки') {
+      if ((await getUser(uid))?.role !== 'rop') return;
+      return ctx.reply('Раздел в разработке (MVP).');
+    }
+    if (text === '🕓 Напоминания') {
+      const u = await getUser(uid);
+      if (!u || (u.role !== 'manager' && u.role !== 'admin')) return;
+      return ctx.reply(
+        'Персональные напоминания — в следующей версии. Напоминания менеджеру по SLA и эскалация РОП уже работают в фоне.',
+      );
     }
     if (text === '⚙️ Помощь' || text === '/help') {
       return ctx.reply('Помощь: @админ, README в репозитории asterauto-crm-bot');
