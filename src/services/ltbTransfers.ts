@@ -43,3 +43,16 @@ export async function listRecentTransfers(limit = 40): Promise<(TransferDoc & { 
   const q = await db().collection(C.transfers).orderBy('createdAt', 'desc').limit(limit).get();
   return q.docs.map((d) => ({ id: d.id, ...(d.data() as TransferDoc) }));
 }
+
+export async function listTransfersSince(
+  since: Timestamp,
+  limit = 400,
+): Promise<(TransferDoc & { id: string })[]> {
+  const q = await db()
+    .collection(C.transfers)
+    .where('createdAt', '>=', since)
+    .orderBy('createdAt', 'desc')
+    .limit(limit)
+    .get();
+  return q.docs.map((d) => ({ id: d.id, ...(d.data() as TransferDoc) }));
+}

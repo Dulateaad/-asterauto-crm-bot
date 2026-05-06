@@ -3,6 +3,7 @@ import { C } from '../collections';
 import { getDb } from '../firebase';
 import type { LeadStatus, TransferReasonId, TransferTargetId } from '../types';
 import { getNextManagerTelegramId } from './ltbUsers';
+import { normalizeBrand } from '../brands';
 
 const db = () => getDb();
 
@@ -96,6 +97,16 @@ export async function createLead(
       : {}),
   } satisfies LeadDoc);
   return ref.id;
+}
+
+export async function countLeadsByBrandSince(since: Timestamp): Promise<Map<string, number>> {
+  const q = await db().collection(C.leads).where('createdAt', '>=', since).limit(500).get();
+  const m = new Map<string, number>();
+  for (const d of q.docs) {
+    const b = normalizeBrand(String((d.data() as LeadDoc).brand || '—'));
+    m.set(b, (m.get(b) || 0) + 1);
+  }
+  return m;
 }
 
 export async function getLead(id: string) {

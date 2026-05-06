@@ -3,7 +3,7 @@ import { config } from './config';
 import { initFirebase, getActiveFirebaseProjectId } from './firebase';
 import { Telegraf, type Context } from 'telegraf';
 import { Timestamp } from 'firebase-admin/firestore';
-import { getUser, isAdmin, ropTelegramIdsFromEnv, setUser, getNextManagerTelegramId, listManagersForBrandPick, formatTelegramUserLabel } from './services/ltbUsers';
+import { getUser, isAdmin, ropTelegramIdsFromEnv, setUser, getNextManagerTelegramId, listManagersForBrandPick, formatTelegramUserLabel, listActiveManagersDetailed } from './services/ltbUsers';
 import {
   createLead,
   getLead,
@@ -16,11 +16,12 @@ import {
   recordTransfer,
   setSlaFlags,
   countToday,
+  countLeadsByBrandSince,
   slaClockMillis,
   type LeadDoc,
 } from './services/ltbLeads';
 import { appendBrandsToBuyer, listMarketingRecipientsForBrand, upsertBuyerContact } from './services/ltbBuyerContacts';
-import { listRecentTransfers, transferReasonLabel, transferTargetLabel } from './services/ltbTransfers';
+import { listRecentTransfers, listTransfersSince, transferReasonLabel, transferTargetLabel } from './services/ltbTransfers';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS } from './brands';
 
@@ -38,7 +39,7 @@ function sess(uid: number): Session {
 function mainKb(role: string) {
   if (role === 'atz') {
     return Markup.keyboard([
-      ['👤 Зарегистрировать клиента'],
+      ['👤 Зарегистрировать клиента', '➕ Добавить клиента'],
       ['🚗 Направить в отдел', '📋 Клиенты за сегодня'],
       ['⚠️ Ожидающие клиенты', '🏠 Главное'],
     ]).resize();
@@ -54,14 +55,14 @@ function mainKb(role: string) {
   if (role === 'manager' || role === 'admin') {
     if (role === 'admin') {
       return Markup.keyboard([
-        ['➕ Новый клиент', '🔄 Передать клиента'],
+        ['➕ Добавить клиента', '🔄 Передать клиента'],
         ['📋 Мои лиды', '📊 Моя статистика'],
-        ['📤 Передачи (кто кому)', '🕓 Напоминания'],
-        ['⚙️ Помощь'],
+        ['📤 Передачи (кто кому)', '📊 Сводка'],
+        ['🕓 Напоминания', '⚙️ Помощь'],
       ]).resize();
     }
     return Markup.keyboard([
-      ['➕ Новый клиент', '🔄 Передать клиента'],
+      ['➕ Добавить клиента', '🔄 Передать клиента'],
       ['📋 Мои лиды', '📊 Моя статистика'],
       ['🕓 Напоминания', '⚙️ Помощь'],
     ]).resize();
@@ -386,6 +387,85 @@ async function sendAdminTransfersReport(ctx: Context, uid: number) {
   await ctx.reply(full.slice(0, max) + '\n… (сообщение обрезано из‑за лимита Telegram; повторите /transfers)');
 }
 
+async function sendAdminStatsSummary(ctx: Context, uid: number) {
+  if (!isAdmin(uid)) {
+    await ctx.reply('Нет прав.');
+    return;
+  }
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayTs = Timestamp.fromDate(todayStart);
+  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  const [mapToday, mapWeek, transfers, managers] = await Promise.all([
+    countLeadsByBrandSince(todayTs),
+    countLeadsByBrandSince(weekTs),
+    listTransfersSince(weekTs, 400),
+    listActiveManagersDetailed(),
+  ]);
+
+  const sortBrandLines = (m: Map<string, number>) =>
+    [...m.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([b, n]) => `  • ${b}: ${n}`)
+      .join('\n') || '  (нет в выборке)';
+
+  const fromCount = new Map<number, number>();
+  for (const t of transfers) {
+    fromCount.set(t.fromTelegramId, (fromCount.get(t.fromTelegramId) || 0) + 1);
+  }
+  const fromSorted = [...fromCount.entries()].sort((a, b) => b[1] - a[1]);
+  const maxTransferNames = 25;
+  const transferLines = await Promise.all(
+    fromSorted.slice(0, maxTransferNames).map(async ([tid, cnt]) => {
+      const label = await formatTelegramUserLabel(tid);
+      return `  • ${label}: ${cnt}`;
+    }),
+  );
+  const transferBlock = [
+    transferLines.join('\n'),
+    fromSorted.length > maxTransferNames ? `  … ещё отправителей: ${fromSorted.length - maxTransferNames}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const noTransfer: string[] = [];
+  for (const mgr of managers) {
+    const tid = parseInt(mgr.id, 10);
+    if (!Number.isFinite(tid) || fromCount.has(tid)) continue;
+    const name = mgr.name?.trim() || 'Без имени';
+    noTransfer.push(`  • ${name} (${tid})`);
+  }
+  noTransfer.sort();
+
+  const parts: string[] = [
+    '📊 Сводка: бренды и передачи',
+    '',
+    'Сегодня (с полуночи, время сервера):',
+    sortBrandLines(mapToday),
+    '',
+    'За 7 дней (агрегация по бренду; в Firestore до 500 лидов в выборке):',
+    sortBrandLines(mapWeek),
+    '',
+    `📤 Исходящие передачи за 7 дней: всего ${transfers.length}`,
+    'Кто передавал:',
+    transferBlock || '  (нет передач)',
+    '',
+    '⚠️ Активные менеджеры без исходящих передач за период:',
+    noTransfer.length > 0 ? noTransfer.join('\n') : '  (нет таких или нет активных менеджеров)',
+  ];
+
+  const full = parts.join('\n').trim();
+  const max = 4000;
+  if (full.length <= max) {
+    await ctx.reply(full);
+    return;
+  }
+  await ctx.reply(full.slice(0, max));
+  await ctx.reply(full.slice(max));
+}
+
 async function runSlaBot(bot: Telegraf) {
   const rows = await listLeadsNeedingSla();
   const now = Date.now();
@@ -510,7 +590,8 @@ async function main() {
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
         '/transfers — кто передал лид и кому (только админ)\n' +
-        'Кнопка «📤 Передачи (кто кому)» в меню админа\n' +
+        '/stats — лиды по брендам (сегодня / 7 дней) и передачи за 7 дней (только админ)\n' +
+        'Кнопки «📤 Передачи (кто кому)» и «📊 Сводка» в меню админа\n' +
         '/lead_<id> — в разработке',
     ),
   );
@@ -519,6 +600,12 @@ async function main() {
     const uid = ctx.from?.id;
     if (!uid) return;
     await sendAdminTransfersReport(ctx, uid);
+  });
+
+  bot.command('stats', async (ctx) => {
+    const uid = ctx.from?.id;
+    if (!uid) return;
+    await sendAdminStatsSummary(ctx, uid);
   });
 
   const handleNotifyBrand = async (ctx: Context) => {
@@ -749,7 +836,7 @@ async function main() {
           return;
         }
         if (await getUser(uid)) {
-          await ctx.answerCbQuery('Для сотрудников — кнопка «Новый клиент».', { show_alert: true });
+          await ctx.answerCbQuery('Для сотрудников — кнопка «➕ Добавить клиента».', { show_alert: true });
           return;
         }
         await ctx.answerCbQuery();
@@ -854,7 +941,7 @@ async function main() {
           return;
         }
         if (await getUser(uid)) {
-          await ctx.answerCbQuery('Для сотрудников — кнопка «Новый клиент».', { show_alert: true });
+          await ctx.answerCbQuery('Для сотрудников — кнопка «➕ Добавить клиента».', { show_alert: true });
           return;
         }
         await ctx.answerCbQuery();
@@ -1306,9 +1393,12 @@ async function main() {
       return;
     }
 
-    // «Новый клиент» / «Зарегистрировать» — одна воронка (ФИО → телефон → …). Клавиатура с «➕» у manager и admin,
-    // но раньше срабатывало только для manager — у admin нажатие молча игнорировалось.
-    if (text === '👤 Зарегистрировать клиента' || text === '➕ Новый клиент') {
+    // «Добавить клиента» / «Зарегистрировать» — одна воронка (ФИО → телефон → …).
+    if (
+      text === '👤 Зарегистрировать клиента' ||
+      text === '➕ Новый клиент' ||
+      text === '➕ Добавить клиента'
+    ) {
       const u = await getUser(uid);
       if (!u || (u.role !== 'atz' && u.role !== 'admin' && u.role !== 'manager')) {
         return ctx.reply('Нет прав.');
@@ -1319,7 +1409,7 @@ async function main() {
     }
     if (text === '🚗 Новая заявка на авто') {
       const u = await getUser(uid);
-      if (u) return ctx.reply('Сотрудникам: оформление — кнопка «Новый клиент» / «Зарегистрировать».');
+      if (u) return ctx.reply('Сотрудникам: оформление — «➕ Добавить клиента» или «Зарегистрировать клиента».');
       return sendClientEntry(ctx, uid);
     }
     if (text === '🔄 Передать клиента') {
@@ -1358,7 +1448,7 @@ async function main() {
     if (text === '🚗 Направить в отдел') {
       if ((await getUser(uid))?.role !== 'atz') return;
       return ctx.reply(
-        'Оформите клиента через «Зарегистрировать клиента». В конце можно: автоназначение по очереди, выбрать менеджера вручную или оставить лид себе.',
+        'Оформите клиента через «Зарегистрировать клиента» или «➕ Добавить клиента». В конце можно: автоназначение по очереди, выбрать менеджера вручную или оставить лид себе.',
       );
     }
     if (text === '⚠️ Ожидающие клиенты' || text === '⚠️ Ожидающие') {
@@ -1374,6 +1464,14 @@ async function main() {
     if (text === '🔄 Передачи' || text === '⚙️ Настройки') {
       if ((await getUser(uid))?.role !== 'rop') return;
       return ctx.reply('Раздел в разработке (MVP).');
+    }
+    if (text === '📤 Передачи (кто кому)') {
+      if (!isAdmin(uid)) return;
+      return sendAdminTransfersReport(ctx, uid);
+    }
+    if (text === '📊 Сводка') {
+      if (!isAdmin(uid)) return;
+      return sendAdminStatsSummary(ctx, uid);
     }
     if (text === '🕓 Напоминания') {
       const u = await getUser(uid);

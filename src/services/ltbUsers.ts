@@ -61,7 +61,7 @@ export async function listActiveManagers(): Promise<number[]> {
   return q.docs.map((d) => parseInt(d.id, 10));
 }
 
-async function listActiveManagerDocs(): Promise<LtbUserDoc[]> {
+export async function listActiveManagersDetailed(): Promise<LtbUserDoc[]> {
   const q = await db()
     .collection(C.users)
     .where('role', '==', 'manager')
@@ -78,7 +78,7 @@ async function listActiveManagerDocs(): Promise<LtbUserDoc[]> {
  */
 export async function getNextManagerTelegramId(leadBrand: string): Promise<number | null> {
   const brand = normalizeBrand(leadBrand);
-  const all = await listActiveManagerDocs();
+  const all = await listActiveManagersDetailed();
   if (all.length === 0) return null;
 
   const ids = (list: LtbUserDoc[]) => list.map((u) => parseInt(u.id, 10));
@@ -121,7 +121,7 @@ export async function getNextManagerTelegramId(leadBrand: string): Promise<numbe
 /** Те же пулы, что у автоназначения: по бренду → универсальные → все менеджеры. */
 export async function listManagersForBrandPick(leadBrand: string): Promise<LtbUserDoc[]> {
   const brand = normalizeBrand(leadBrand);
-  const all = await listActiveManagerDocs();
+  const all = await listActiveManagersDetailed();
   if (all.length === 0) return [];
   const explicit = all.filter((u) => {
     const b = u.brands;
