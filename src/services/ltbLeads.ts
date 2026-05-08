@@ -228,6 +228,52 @@ export async function countToday() {
   return countLeadsSince(Timestamp.fromDate(d));
 }
 
+/** Границы локального календарного дня (как countToday): daysAgo 0 = сегодня 00:00, 1 = вчера 00:00 */
+function localDayStartMidnight(daysAgoFromToday: number): Date {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - daysAgoFromToday);
+  return d;
+}
+
+export async function countLeadsCreatedBetween(start: Timestamp, endExclusive: Timestamp): Promise<number> {
+  const q = await db()
+    .collection(C.leads)
+    .where('createdAt', '>=', start)
+    .where('createdAt', '<', endExclusive)
+    .get();
+  return q.size;
+}
+
+/** Лиды, созданные за полные локальные сутки. daysAgo: 1 = вчера, 2 = позавчера */
+export async function countLeadsOnLocalCalendarDay(daysAgo: number): Promise<number> {
+  const start = localDayStartMidnight(daysAgo);
+  const endExclusive = localDayStartMidnight(daysAgo - 1);
+  return countLeadsCreatedBetween(Timestamp.fromDate(start), Timestamp.fromDate(endExclusive));
+}
+
+/** Как countLeadsOnLocalCalendarDay, но только лиды, назначенные на менеджеров из пула (лимит скана). */
+export async function countLeadsOnLocalDayForAssignedPool(
+  assignedTgIds: Set<number>,
+  daysAgo: number,
+  scanLimit = 800,
+): Promise<number> {
+  if (assignedTgIds.size === 0) return 0;
+  const start = localDayStartMidnight(daysAgo);
+  const endExclusive = localDayStartMidnight(daysAgo - 1);
+  const q = await db()
+    .collection(C.leads)
+    .where('createdAt', '>=', Timestamp.fromDate(start))
+    .where('createdAt', '<', Timestamp.fromDate(endExclusive))
+    .limit(scanLimit)
+    .get();
+  let n = 0;
+  for (const d of q.docs) {
+    if (assignedTgIds.has((d.data() as LeadDoc).assignedTo)) n++;
+  }
+  return n;
+}
+
 /** Лиды с createdAt >= since, у которых assignedTo входит в отдел (скан ограничен). */
 export async function countLeadsSinceForAssignedPool(
   assignedTgIds: Set<number>,

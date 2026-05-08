@@ -33,6 +33,8 @@ import {
   countLeadsSince,
   countLeadsByBrandSince,
   countLeadsSinceForAssignedPool,
+  countLeadsOnLocalCalendarDay,
+  countLeadsOnLocalDayForAssignedPool,
   countAllLeads,
   slaClockMillis,
   type LeadDoc,
@@ -60,6 +62,16 @@ const sessions = new Map<number, Session>();
 function sess(uid: number): Session {
   if (!sessions.has(uid)) sessions.set(uid, { key: 'idle', data: {} });
   return sessions.get(uid)!;
+}
+
+/** Дата локального календарного дня (как в countToday): daysAgo 0 = сегодня */
+function ruLocalDateLabel(daysAgo: number): string {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - daysAgo);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}.${d.getFullYear()}`;
 }
 
 function mainKb(role: string) {
@@ -431,9 +443,11 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   const todayTs = Timestamp.fromDate(todayStart);
   const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-  const [mapToday, mapWeek, transfers, managers] = await Promise.all([
+  const [mapToday, mapWeek, ydayTotal, y2Total, transfers, managers] = await Promise.all([
     countLeadsByBrandSince(todayTs),
     countLeadsByBrandSince(weekTs),
+    countLeadsOnLocalCalendarDay(1),
+    countLeadsOnLocalCalendarDay(2),
     listTransfersSince(weekTs, 400),
     listActiveManagersDetailed(),
   ]);
@@ -475,7 +489,11 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   const parts: string[] = [
     '📊 Сводка: бренды и передачи',
     '',
-    'Сегодня (с полуночи, время сервера):',
+    '📅 Всего новых лидов (по дате создания, время сервера):',
+    `  • Вчера (${ruLocalDateLabel(1)}): ${ydayTotal}`,
+    `  • Позавчера (${ruLocalDateLabel(2)}): ${y2Total}`,
+    '',
+    'Сегодня (с полуночи, по брендам; до 500 лидов в выборке):',
     sortBrandLines(mapToday),
     '',
     'За 7 дней (агрегация по бренду; в Firestore до 500 лидов в выборке):',
@@ -529,8 +547,10 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
   const todayTs = Timestamp.fromDate(todayStart);
   const todayMs = todayTs.toMillis();
   const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const [leadsToday, leadsWeek, xferWeek] = await Promise.all([
+  const [leadsToday, leadsYday, leadsY2, leadsWeek, xferWeek] = await Promise.all([
     countLeadsSinceForAssignedPool(pool, todayTs, 600),
+    countLeadsOnLocalDayForAssignedPool(pool, 1, 800),
+    countLeadsOnLocalDayForAssignedPool(pool, 2, 800),
     countLeadsSinceForAssignedPool(pool, weekTs, 600),
     listTransfersSince(weekTs, 600),
   ]);
@@ -544,8 +564,10 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
     `📊 Отдел: ${dept}`,
     `Менеджеров в отделе: ${mgrIds.length}`,
     '',
-    'Сегодня:',
-    `  • Новых лидов на команду (лимит скана): ${leadsToday}`,
+    'Новые лиды на команду по дням (назначение на менеджеров отдела, лимит скана):',
+    `  • Сегодня: ${leadsToday}`,
+    `  • Вчера (${ruLocalDateLabel(1)}): ${leadsYday}`,
+    `  • Позавчера (${ruLocalDateLabel(2)}): ${leadsY2}`,
     `  • Передач из отдела: ${outToday}`,
     `  • Передач в отдел: ${inToday}`,
     '',
@@ -573,9 +595,11 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
   const todayMs = todayTs.toMillis();
   const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-  const [mine, todayAll, totalLeads, totalTransfers, weekTransfers] = await Promise.all([
+  const [mine, todayAll, leadsYday, leadsY2, totalLeads, totalTransfers, weekTransfers] = await Promise.all([
     listMyLeads(viewerUid).then((rows) => rows.length),
     countToday(),
+    countLeadsOnLocalCalendarDay(1),
+    countLeadsOnLocalCalendarDay(2),
     countAllLeads(),
     countAllTransfers(),
     listTransfersSince(weekTs, 500),
@@ -605,7 +629,10 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
     `  • У вас в работе (в списке «Мои лиды»): ${mine}`,
     '',
     '🌐 Общее по базе (все лиды и передачи, с начала учёта):',
-    `  • Лидов сегодня: ${todayAll}`,
+    '📅 Новые лиды по календарным дням (дата создания, время сервера бота):',
+    `  • Сегодня: ${todayAll}`,
+    `  • Вчера (${ruLocalDateLabel(1)}): ${leadsYday}`,
+    `  • Позавчера (${ruLocalDateLabel(2)}): ${leadsY2}`,
     `  • Лидов всего: ${totalLeads}`,
     `  • Передач всего: ${totalTransfers}`,
     '',
@@ -642,8 +669,10 @@ async function sendAdminLeadsDigest(ctx: Context, uid: number) {
   todayStart.setHours(0, 0, 0, 0);
   const todayTs = Timestamp.fromDate(todayStart);
   const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const [todayCount, total, weekTransfers, recMap] = await Promise.all([
+  const [todayCount, ydayCount, y2Count, total, weekTransfers, recMap] = await Promise.all([
     countLeadsSince(todayTs),
+    countLeadsOnLocalCalendarDay(1),
+    countLeadsOnLocalCalendarDay(2),
     countAllLeads(),
     listTransfersSince(weekTs, 500),
     aggregateRecipientCounts(400),
@@ -658,8 +687,11 @@ async function sendAdminLeadsDigest(ctx: Context, uid: number) {
   const parts = [
     '📌 Сводка лидов (админ)',
     '',
-    `Лидов сегодня: ${todayCount}`,
-    `Лидов всего в базе: ${total}`,
+    '📅 Лиды по дням (создание, время сервера):',
+    `  • Сегодня: ${todayCount}`,
+    `  • Вчера (${ruLocalDateLabel(1)}): ${ydayCount}`,
+    `  • Позавчера (${ruLocalDateLabel(2)}): ${y2Count}`,
+    `  • Всего в базе: ${total}`,
     '',
     `Передач за 7 дней (в выборке): ${weekTransfers.length}`,
     'Кому чаще всего передавали (по последним записям в журнале):',
