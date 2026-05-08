@@ -56,3 +56,22 @@ export async function listTransfersSince(
     .get();
   return q.docs.map((d) => ({ id: d.id, ...(d.data() as TransferDoc) }));
 }
+
+export function countTransfersFromPool(rows: (TransferDoc & { id: string })[], fromIds: Set<number>): number {
+  return rows.reduce((acc, t) => acc + (fromIds.has(t.fromTelegramId) ? 1 : 0), 0);
+}
+
+export function countTransfersToPool(rows: (TransferDoc & { id: string })[], toIds: Set<number>): number {
+  return rows.reduce((acc, t) => acc + (toIds.has(t.toTelegramId) ? 1 : 0), 0);
+}
+
+/** Сколько раз лид попадал к получателю (по последним limit передачам, новые сверху). */
+export async function aggregateRecipientCounts(limit = 500): Promise<Map<number, number>> {
+  const q = await db().collection(C.transfers).orderBy('createdAt', 'desc').limit(limit).get();
+  const m = new Map<number, number>();
+  for (const d of q.docs) {
+    const to = (d.data() as TransferDoc).toTelegramId;
+    m.set(to, (m.get(to) || 0) + 1);
+  }
+  return m;
+}

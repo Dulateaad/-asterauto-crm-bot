@@ -13,11 +13,25 @@ export type LtbUserDoc = {
   role: UserRole;
   active: boolean;
   /**
+   * Одинаковый slug у РОП и его менеджеров — сводка «по отделу» в боте.
+   * Задаётся админом: /setdept &lt;telegram_id&gt; &lt;slug&gt;
+   */
+  departmentId?: string;
+  /**
    * Для manager: если задано и не пусто — лид только по этим брендам; иначе менеджер в пуле «на все бренды».
    * Для rop / atz (админ зала) / admin: только в профиле; очередь лидов (`getNextManagerTelegramId`) — только manager.
    */
   brands?: string[];
 };
+
+export function normalizeDepartmentId(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_-]/g, '')
+    .slice(0, 64);
+}
 
 export async function getUser(telegramId: number): Promise<LtbUserDoc | null> {
   const ref = db().collection(C.users).doc(String(telegramId));
@@ -138,6 +152,61 @@ export async function formatTelegramUserLabel(telegramId: number): Promise<strin
   const n = u?.name?.trim();
   if (n) return `${n} (${telegramId})`;
   return String(telegramId);
+}
+
+/** Имя из профиля без Telegram id — для сообщений «передано Дяне». */
+export async function formatTelegramShortName(telegramId: number): Promise<string> {
+  const u = await getUser(telegramId);
+  const n = u?.name?.trim();
+  if (n) return n;
+  return `сотрудник ${telegramId}`;
+}
+
+export async function updateUserDepartment(telegramId: number, departmentId: string | null): Promise<void> {
+  const ref = db().collection(C.users).doc(String(telegramId));
+  const now = Timestamp.now();
+  const prev = await ref.get();
+  if (!prev.exists) {
+    throw new Error('NO_USER_DOC');
+  }
+  if (!departmentId) {
+    await ref.update({ departmentId: FieldValue.delete(), updatedAt: now });
+    return;
+  }
+  await ref.update({ departmentId: normalizeDepartmentId(departmentId), updatedAt: now });
+}
+
+/** Менеджеры отдела (по полю departmentId). */
+export async function listManagerTgIdsInDepartment(departmentId: string): Promise<number[]> {
+  const norm = normalizeDepartmentId(departmentId);
+  if (!norm) return [];
+  const q = await db()
+    .collection(C.users)
+    .where('role', '==', 'manager')
+    .where('active', '==', true)
+    .get();
+  const ids: number[] = [];
+  for (const d of q.docs) {
+    const data = d.data() as LtbUserDoc;
+    if (normalizeDepartmentId(String(data.departmentId || '')) !== norm) continue;
+    const n = parseInt(d.id, 10);
+    if (Number.isFinite(n)) ids.push(n);
+  }
+  return ids.sort((a, b) => a - b);
+}
+
+/** Рассылка служебных сообщений: активные manager, rop, atz (не покупатели). */
+export async function listStaffBroadcastRecipientIds(): Promise<number[]> {
+  const roles: UserRole[] = ['manager', 'rop', 'atz'];
+  const out = new Set<number>();
+  for (const role of roles) {
+    const q = await db().collection(C.users).where('role', '==', role).where('active', '==', true).get();
+    for (const d of q.docs) {
+      const n = parseInt(d.id, 10);
+      if (Number.isFinite(n)) out.add(n);
+    }
+  }
+  return Array.from(out).sort((a, b) => a - b);
 }
 
 export function isAdmin(telegramId: number): boolean {

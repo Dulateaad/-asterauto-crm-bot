@@ -228,6 +228,27 @@ export async function countToday() {
   return countLeadsSince(Timestamp.fromDate(d));
 }
 
+/** Лиды с createdAt >= since, у которых assignedTo входит в отдел (скан ограничен). */
+export async function countLeadsSinceForAssignedPool(
+  assignedTgIds: Set<number>,
+  since: Timestamp,
+  scanLimit = 600,
+): Promise<number> {
+  if (assignedTgIds.size === 0) return 0;
+  const q = await db().collection(C.leads).where('createdAt', '>=', since).limit(scanLimit).get();
+  let n = 0;
+  for (const d of q.docs) {
+    const a = (d.data() as LeadDoc).assignedTo;
+    if (assignedTgIds.has(a)) n++;
+  }
+  return n;
+}
+
+export async function countAllLeads(): Promise<number> {
+  const snap = await db().collection(C.leads).count().get();
+  return snap.data().count;
+}
+
 /** Лиды покупателей из Telegram, которым пора отправить первый вопрос опроса. */
 export async function listLeadsNeedingBuyerSurveyVisit(
   minAgeMs: number,

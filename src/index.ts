@@ -3,7 +3,20 @@ import { config } from './config';
 import { initFirebase, getActiveFirebaseProjectId } from './firebase';
 import { Telegraf, type Context } from 'telegraf';
 import { Timestamp } from 'firebase-admin/firestore';
-import { getUser, isAdmin, ropTelegramIdsFromEnv, setUser, getNextManagerTelegramId, listManagersForBrandPick, formatTelegramUserLabel, listActiveManagersDetailed } from './services/ltbUsers';
+import {
+  getUser,
+  isAdmin,
+  ropTelegramIdsFromEnv,
+  setUser,
+  listManagersForBrandPick,
+  formatTelegramUserLabel,
+  formatTelegramShortName,
+  listActiveManagersDetailed,
+  listManagerTgIdsInDepartment,
+  listStaffBroadcastRecipientIds,
+  updateUserDepartment,
+  normalizeDepartmentId,
+} from './services/ltbUsers';
 import {
   createLead,
   getLead,
@@ -16,12 +29,23 @@ import {
   recordTransfer,
   setSlaFlags,
   countToday,
+  countLeadsSince,
   countLeadsByBrandSince,
+  countLeadsSinceForAssignedPool,
+  countAllLeads,
   slaClockMillis,
   type LeadDoc,
 } from './services/ltbLeads';
 import { appendBrandsToBuyer, listMarketingRecipientsForBrand, upsertBuyerContact } from './services/ltbBuyerContacts';
-import { listRecentTransfers, listTransfersSince, transferReasonLabel, transferTargetLabel } from './services/ltbTransfers';
+import {
+  listRecentTransfers,
+  listTransfersSince,
+  transferReasonLabel,
+  transferTargetLabel,
+  countTransfersFromPool,
+  countTransfersToPool,
+  aggregateRecipientCounts,
+} from './services/ltbTransfers';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS } from './brands';
 
@@ -58,7 +82,8 @@ function mainKb(role: string) {
         ['➕ Добавить клиента', '🔄 Передать клиента'],
         ['📋 Мои лиды', '📊 Моя статистика'],
         ['📤 Передачи (кто кому)', '📊 Сводка'],
-        ['🕓 Напоминания', '⚙️ Помощь'],
+        ['📌 Лиды (всего)', '🕓 Напоминания'],
+        ['⚙️ Помощь'],
       ]).resize();
     }
     return Markup.keyboard([
@@ -76,7 +101,7 @@ function brandKb() {
 
 function atzConfirmKb() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('📤 Автоочередь по бренду', 'atz_yes:queue')],
+    [Markup.button.callback('📤 Назначить по бренду', 'atz_yes:queue')],
     [Markup.button.callback('👤 Выбрать менеджера', 'atz_pick_mgr')],
     [Markup.button.callback('👤 Оставить себе', 'atz_yes:self')],
     [Markup.button.callback('❌ Отмена', 'atz_no')],
@@ -91,18 +116,14 @@ function atzConfirmSummary(s: Session) {
 
 /** Новые лиды без опроса оплаты/бюджета — технические поля для Firestore */
 const DEFAULT_LEAD_PAYMENT = 'cash' as const;
-const DEFAULT_LEAD_BUDGET = '';
 
-function leadNotifyBody(leadId: string, fio: string, phone: string, brand: string, budget: string) {
-  let t =
-    `🔔 Новый лид #${leadId}\n` + `ФИО: ${fio}\nТелефон: ${phone}\n` + `Бренд: ${brand}`;
-  if (budget.trim()) t += `\nБюджет: ${budget}`;
-  return t;
+function leadNotifyBody(leadId: string, fio: string, phone: string, brand: string) {
+  return `🔔 Новый лид #${leadId}\n` + `ФИО: ${fio}\nТелефон: ${phone}\n` + `Бренд: ${brand}`;
 }
 
 function buyConfirmKb() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('📤 Автоочередь по бренду', 'buy_auto')],
+    [Markup.button.callback('📤 Назначить по бренду', 'buy_auto')],
     [Markup.button.callback('👤 Выбрать менеджера', 'buy_pick_mgr')],
     [Markup.button.callback('❌ Отмена', 'buy_no')],
   ]);
@@ -165,7 +186,6 @@ const REASON: { id: TransferReasonId; label: string }[] = [
   { id: 'high_price', label: '💰 Высокая цена' },
   { id: 'no_stock', label: '🚫 Нет наличия' },
   { id: 'brand_dislike', label: '❌ Не понравился бренд' },
-  { id: 'credit_fail', label: '📉 Не прошел кредит' },
   { id: 'trade_want', label: '🔁 Хочет обмен' },
   { id: 'need_used', label: '🚗 Нужен Б/У' },
 ];
@@ -361,8 +381,8 @@ async function sendAdminTransfersReport(ctx: Context, uid: number) {
   for (let i = 0; i < rows.length; i++) {
     const t = rows[i]!;
     const [fromL, toL, leadSnap] = await Promise.all([
-      formatTelegramUserLabel(t.fromTelegramId),
-      formatTelegramUserLabel(t.toTelegramId),
+      formatTelegramShortName(t.fromTelegramId),
+      formatTelegramShortName(t.toTelegramId),
       getLead(t.leadId),
     ]);
     const who = leadSnap?.fio?.trim() || `лид #${t.leadId}`;
@@ -419,7 +439,7 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   const maxTransferNames = 25;
   const transferLines = await Promise.all(
     fromSorted.slice(0, maxTransferNames).map(async ([tid, cnt]) => {
-      const label = await formatTelegramUserLabel(tid);
+      const label = await formatTelegramShortName(tid);
       return `  • ${label}: ${cnt}`;
     }),
   );
@@ -464,6 +484,107 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   }
   await ctx.reply(full.slice(0, max));
   await ctx.reply(full.slice(max));
+}
+
+async function sendRopDepartmentStats(ctx: Context, uid: number) {
+  const u = await getUser(uid);
+  if (!u || u.role !== 'rop') {
+    await ctx.reply('Раздел только для РОП.');
+    return;
+  }
+  const rawDept = u.departmentId?.trim();
+  if (!rawDept) {
+    await ctx.reply(
+      'У вашей учётной записи не задан отдел.\n' +
+        `Попросите админа выполнить, например:\n/setdept ${uid} changan\n` +
+        'и тем же ключом привязать менеджеров:\n/setdept <telegram_менеджера> changan',
+    );
+    return;
+  }
+  const dept = normalizeDepartmentId(rawDept);
+  const mgrIds = await listManagerTgIdsInDepartment(dept);
+  if (mgrIds.length === 0) {
+    await ctx.reply(
+      `Отдел «${dept}»: пока нет менеджеров с таким departmentId. Админ: /setdept <tg_менеджера> ${dept}`,
+    );
+    return;
+  }
+  const pool = new Set(mgrIds);
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayTs = Timestamp.fromDate(todayStart);
+  const todayMs = todayTs.toMillis();
+  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const [leadsToday, leadsWeek, xferWeek] = await Promise.all([
+    countLeadsSinceForAssignedPool(pool, todayTs, 600),
+    countLeadsSinceForAssignedPool(pool, weekTs, 600),
+    listTransfersSince(weekTs, 600),
+  ]);
+  const xferToday = xferWeek.filter((t) => t.createdAt.toMillis() >= todayMs);
+  const outToday = countTransfersFromPool(xferToday, pool);
+  const inToday = countTransfersToPool(xferToday, pool);
+  const outWeek = countTransfersFromPool(xferWeek, pool);
+  const inWeek = countTransfersToPool(xferWeek, pool);
+
+  const lines = [
+    `📊 Отдел: ${dept}`,
+    `Менеджеров в отделе: ${mgrIds.length}`,
+    '',
+    'Сегодня:',
+    `  • Новых лидов на команду (лимит скана): ${leadsToday}`,
+    `  • Передач из отдела: ${outToday}`,
+    `  • Передач в отдел: ${inToday}`,
+    '',
+    'За 7 дней:',
+    `  • Новых лидов на команду (лимит скана): ${leadsWeek}`,
+    `  • Передач из отдела: ${outWeek}`,
+    `  • Передач в отдел: ${inWeek}`,
+    '',
+    'Пояснение: лиды — среди созданных за период, назначенные на менеджеров отдела (скан до 600). Передачи — журнал за 7 дней (до 600 записей).',
+  ];
+  await ctx.reply(lines.join('\n'));
+}
+
+async function sendAdminLeadsDigest(ctx: Context, uid: number) {
+  if (!isAdmin(uid)) {
+    await ctx.reply('Нет прав.');
+    return;
+  }
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayTs = Timestamp.fromDate(todayStart);
+  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const [todayCount, total, weekTransfers, recMap] = await Promise.all([
+    countLeadsSince(todayTs),
+    countAllLeads(),
+    listTransfersSince(weekTs, 500),
+    aggregateRecipientCounts(400),
+  ]);
+  const topRecv = [...recMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
+  const topLines = await Promise.all(
+    topRecv.map(async ([tgId, cnt]) => {
+      const nm = await formatTelegramShortName(tgId);
+      return `  • ${nm}: ${cnt} раз (в последних передачах)`;
+    }),
+  );
+  const parts = [
+    '📌 Сводка лидов (админ)',
+    '',
+    `Лидов сегодня: ${todayCount}`,
+    `Лидов всего в базе: ${total}`,
+    '',
+    `Передач за 7 дней (в выборке): ${weekTransfers.length}`,
+    'Кому чаще всего передавали (по последним записям в журнале):',
+    topLines.length ? topLines.join('\n') : '  —',
+    '',
+    'Фильтр по месяцам — в следующих версиях.',
+  ];
+  let full = parts.join('\n');
+  const max = 4000;
+  if (full.length > max) full = full.slice(0, max) + '…';
+  await ctx.reply(full);
 }
 
 async function runSlaBot(bot: Telegraf) {
@@ -586,12 +707,16 @@ async function main() {
   bot.command('help', (ctx) =>
     ctx.reply(
       'Покупатель: /start — заявка на авто, бренд и контакты; позже — короткий опрос и рассылки по согласию.\n\n' +
+        'РОП:\n«📊 Статистика» — сводка по отделу (у РОП и менеджеров в Firestore одинаковый отдел; задаёт админ: /setdept).\n\n' +
         'Админ:\n/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
         '/transfers — кто передал лид и кому (только админ)\n' +
         '/stats — лиды по брендам (сегодня / 7 дней) и передачи за 7 дней (только админ)\n' +
-        'Кнопки «📤 Передачи (кто кому)» и «📊 Сводка» в меню админа\n' +
+        '/admin_digest — лиды сегодня / всего + кому чаще передавали (только админ)\n' +
+        '/broadcast Текст — сообщение всем manager, РОП и АТЗ (только админ)\n' +
+        '/setdept <telegram_id> <отдел> — привязка РОП и менеджеров к отделу (slug, напр. changan)\n' +
+        'Кнопки «📤 Передачи», «📊 Сводка», «📌 Лиды (всего)» в меню админа\n' +
         '/lead_<id> — в разработке',
     ),
   );
@@ -601,6 +726,68 @@ async function main() {
     if (!uid) return;
     await sendAdminTransfersReport(ctx, uid);
   });
+
+  bot.command('admin_digest', async (ctx) => {
+    const uid = ctx.from?.id;
+    if (!uid) return;
+    await sendAdminLeadsDigest(ctx, uid);
+  });
+
+  const handleBroadcast = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !isAdmin(uid)) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/broadcast(?:@\S+)?\s+([\s\S]+)$/is);
+    const body = m?.[1]?.trim();
+    if (!body) {
+      return ctx.reply('Формат: /broadcast Текст сообщения для manager, РОП и АТЗ.');
+    }
+    const ids = await listStaffBroadcastRecipientIds();
+    let ok = 0;
+    for (const tid of ids) {
+      if (tid === uid) continue;
+      try {
+        await ctx.telegram.sendMessage(tid, `📣 Сообщение от администрации:\n\n${body}`);
+        ok++;
+      } catch {
+        /* */
+      }
+    }
+    return ctx.reply(`Готово: доставлено ${ok} из ${ids.length} (вы себе не дублируем).`);
+  };
+  bot.hears(/^\/broadcast(?:@\S+)?(?:\s+(.+))?$/is, handleBroadcast);
+  bot.command('broadcast', handleBroadcast);
+
+  const handleSetdept = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !isAdmin(uid)) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/setdept(?:@\S+)?\s+(\d+)\s+(\S+)/i);
+    if (!m) {
+      return ctx.reply('Формат: /setdept 123456789 changan\nСнять отдел: /setdept 123456789 -');
+    }
+    const tg = parseInt(m[1]!, 10);
+    const token = m[2]!;
+    if (Number.isNaN(tg)) return ctx.reply('Неверный telegram id.');
+    const target = await getUser(tg);
+    if (!target) return ctx.reply('Пользователь не в базе. Сначала /adduser.');
+    try {
+      if (token === '-' || token.toLowerCase() === 'none') {
+        await updateUserDepartment(tg, null);
+        return ctx.reply(`Ок. У ${tg} отдел снят.`);
+      }
+      await updateUserDepartment(tg, token);
+      return ctx.reply(`Ок. Пользователь ${tg} (${target.role}) → отдел «${normalizeDepartmentId(token)}».`);
+    } catch {
+      return ctx.reply('Не удалось сохранить. Проверьте Firestore.');
+    }
+  };
+  bot.hears(/^\/setdept(?:@\S+)?(?:\s+(.+))?$/is, handleSetdept);
+  bot.command('setdept', handleSetdept);
 
   bot.command('stats', async (ctx) => {
     const uid = ctx.from?.id;
@@ -638,6 +825,7 @@ async function main() {
   };
 
   bot.hears(/^\/notify_brand(?:@\S+)?(?:\s+(.+))?$/is, handleNotifyBrand);
+  bot.command('notify_brand', handleNotifyBrand);
 
   const handleAdduser = async (ctx: Context) => {
     const uid = ctx.from?.id;
@@ -846,10 +1034,7 @@ async function main() {
         }
         s.key = 'buyer_pick_manager';
         const rows = list.slice(0, 28).map((mgr) => [
-          Markup.button.callback(
-            `${(mgr.name?.trim() || 'Менеджер').slice(0, 24)} · ${mgr.id}`,
-            `buy_m:${mgr.id}`,
-          ),
+          Markup.button.callback(`${(mgr.name?.trim() || 'Менеджер').slice(0, 36)}`, `buy_m:${mgr.id}`),
         ]);
         rows.push([Markup.button.callback('◀️ Назад', 'buy_mgr_back')]);
         return ctx.editMessageText(
@@ -900,7 +1085,7 @@ async function main() {
             phone,
             brand,
             payment: DEFAULT_LEAD_PAYMENT,
-            budget: DEFAULT_LEAD_BUDGET,
+            budget: '',
             createdBy: uid,
             buyerTelegramId: uid,
           },
@@ -916,12 +1101,12 @@ async function main() {
         });
         s.key = 'idle';
         s.data = {};
-        const label = await formatTelegramUserLabel(m);
+        const label = await formatTelegramShortName(m);
         await ctx.editMessageText(
           `✅ Заявка #${leadId} отправлена.\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET)}\n(онлайн Telegram)`;
+        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand)}\n(онлайн Telegram)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -945,20 +1130,32 @@ async function main() {
           return;
         }
         await ctx.answerCbQuery();
-        const m = await getNextManagerTelegramId(String(s.data.brand));
-        if (!m) {
+        const brand = String(s.data.brand);
+        const list = await listManagersForBrandPick(brand);
+        if (list.length === 0) {
           return ctx.editMessageText('Сейчас нет доступных менеджеров по этому бренду. Попробуйте «Выбрать менеджера» или позже.');
         }
+        if (list.length > 1) {
+          s.key = 'buyer_pick_manager';
+          const rows = list.slice(0, 28).map((mgr) => [
+            Markup.button.callback(`${(mgr.name?.trim() || 'Менеджер').slice(0, 36)}`, `buy_m:${mgr.id}`),
+          ]);
+          rows.push([Markup.button.callback('◀️ Назад', 'buy_mgr_back')]);
+          return ctx.editMessageText(
+            `На бренд «${brand}» несколько менеджеров — выберите ответственного:`,
+            { reply_markup: Markup.inlineKeyboard(rows).reply_markup },
+          );
+        }
+        const m = parseInt(list[0]!.id, 10);
         const fio = String(s.data.fio);
         const phone = String(s.data.phone);
-        const brand = String(s.data.brand);
         const leadId = await createLead(
           {
             fio,
             phone,
             brand,
             payment: DEFAULT_LEAD_PAYMENT,
-            budget: DEFAULT_LEAD_BUDGET,
+            budget: '',
             createdBy: uid,
             buyerTelegramId: uid,
           },
@@ -974,12 +1171,12 @@ async function main() {
         });
         s.key = 'idle';
         s.data = {};
-        const label = await formatTelegramUserLabel(m);
+        const label = await formatTelegramShortName(m);
         await ctx.editMessageText(
           `✅ Заявка #${leadId} отправлена (автоочередь).\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET)}\n(онлайн Telegram)`;
+        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand)}\n(онлайн Telegram)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -1164,10 +1361,7 @@ async function main() {
         }
         s.key = 'atz_pick_manager';
         const rows = list.slice(0, 28).map((mgr) => [
-          Markup.button.callback(
-            `${(mgr.name?.trim() || 'Менеджер').slice(0, 24)} · ${mgr.id}`,
-            `atz_m:${mgr.id}`,
-          ),
+          Markup.button.callback(`${(mgr.name?.trim() || 'Менеджер').slice(0, 36)}`, `atz_m:${mgr.id}`),
         ]);
         rows.push([Markup.button.callback('◀️ Назад', 'atz_mgr_back')]);
         return ctx.editMessageText(
@@ -1209,16 +1403,16 @@ async function main() {
             phone,
             brand,
             payment: DEFAULT_LEAD_PAYMENT,
-            budget: DEFAULT_LEAD_BUDGET,
+            budget: '',
             createdBy: uid,
           },
           m,
         );
         sess(uid).key = 'idle';
         sess(uid).data = {};
-        const label = await formatTelegramUserLabel(m);
+        const label = await formatTelegramShortName(m);
         await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}.\nОтветственный: ${label}`);
-        const text = leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET);
+        const text = leadNotifyBody(leadId, fio, phone, brand);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1247,7 +1441,24 @@ async function main() {
         if (keepSelf) {
           m = uid;
         } else {
-          m = await getNextManagerTelegramId(String(s.data.brand));
+          const brand = String(s.data.brand);
+          const list = await listManagersForBrandPick(brand);
+          if (list.length === 0) {
+            return ctx.editMessageText('Нет менеджеров в системе. Добавьте manager через /adduser.');
+          }
+          if (list.length === 1) {
+            m = parseInt(list[0]!.id, 10);
+          } else {
+            s.key = 'atz_pick_manager';
+            const rows = list.slice(0, 28).map((mgr) => [
+              Markup.button.callback(`${(mgr.name?.trim() || 'Менеджер').slice(0, 36)}`, `atz_m:${mgr.id}`),
+            ]);
+            rows.push([Markup.button.callback('◀️ Назад', 'atz_mgr_back')]);
+            return ctx.editMessageText(
+              `На бренд «${brand}» несколько менеджеров — выберите ответственного:`,
+              { reply_markup: Markup.inlineKeyboard(rows).reply_markup },
+            );
+          }
         }
         if (!m) {
           return ctx.editMessageText('Нет менеджеров в системе. Добавьте manager через /adduser.');
@@ -1261,17 +1472,17 @@ async function main() {
             phone,
             brand,
             payment: DEFAULT_LEAD_PAYMENT,
-            budget: DEFAULT_LEAD_BUDGET,
+            budget: '',
             createdBy: uid,
           },
           m,
         );
         sess(uid).key = 'idle';
         sess(uid).data = {};
-        const label = await formatTelegramUserLabel(m);
+        const label = await formatTelegramShortName(m);
         const assignLabel = keepSelf ? 'закреплён за вами' : `ответственный: ${label}`;
         await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}. ${assignLabel}.`);
-        const text = leadNotifyBody(leadId, fio, phone, brand, DEFAULT_LEAD_BUDGET);
+        const text = leadNotifyBody(leadId, fio, phone, brand);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1380,9 +1591,11 @@ async function main() {
           s.data.target as TransferTargetId,
           text,
         );
-        const newLabel = await formatTelegramUserLabel(r.newManager);
-        await ctx.reply(`✅ Клиент передан. Новый ответственный: ${newLabel}`);
-        const msg = `🔄 Вам передан лид #${s.data.leadId}\nОт: ${uid}\n` + `Комментарий: ${text}`;
+        const newLabel = await formatTelegramShortName(r.newManager);
+        await ctx.reply(`✅ Клиент передан. Ответственный: ${newLabel}`);
+        const fromName = await formatTelegramShortName(uid);
+        const msg =
+          `🔄 Вам передан лид #${s.data.leadId}\n` + `От: ${fromName}\n` + `Комментарий: ${text}`;
         try {
           const kb = leadActionsKb(String(s.data.leadId));
           await ctx.telegram.sendMessage(r.newManager, msg, { reply_markup: kb.reply_markup });
@@ -1433,12 +1646,13 @@ async function main() {
         .join('\n');
       return ctx.reply(body);
     }
-    if (text === '📊 Моя статистика' || (text === '📊 Статистика' && (await getUser(uid))?.role === 'rop')) {
+    if (text === '📊 Статистика') {
       const u = await getUser(uid);
+      if (u?.role === 'rop') return sendRopDepartmentStats(ctx, uid);
+      return;
+    }
+    if (text === '📊 Моя статистика') {
       const n = await countToday();
-      if (u?.role === 'rop') {
-        return ctx.reply(`Сегодня (все лиды в боте): ${n} нов.`);
-      }
       const mine = (await listMyLeads(uid)).length;
       return ctx.reply(`Ваши активные в списке: ${mine}\nСегодня (все): ${n} нов.`);
     }
@@ -1459,7 +1673,9 @@ async function main() {
     }
     if (text === '📋 Все лиды' || text === '⏰ Просроченные' || text === '👥 По менеджерам') {
       if ((await getUser(uid))?.role !== 'rop') return;
-      return ctx.reply('Раздел в разработке. Краткая сводка: кнопка «📊 Статистика».');
+      return ctx.reply(
+        'Раздел в разработке. Сводка по отделу: кнопка «📊 Статистика» (нужен /setdept у админа).',
+      );
     }
     if (text === '🔄 Передачи' || text === '⚙️ Настройки') {
       if ((await getUser(uid))?.role !== 'rop') return;
@@ -1472,6 +1688,10 @@ async function main() {
     if (text === '📊 Сводка') {
       if (!isAdmin(uid)) return;
       return sendAdminStatsSummary(ctx, uid);
+    }
+    if (text === '📌 Лиды (всего)') {
+      if (!isAdmin(uid)) return;
+      return sendAdminLeadsDigest(ctx, uid);
     }
     if (text === '🕓 Напоминания') {
       const u = await getUser(uid);
