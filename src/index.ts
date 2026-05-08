@@ -16,6 +16,7 @@ import {
   listStaffBroadcastRecipientIds,
   updateUserDepartment,
   normalizeDepartmentId,
+  patchUserBrands,
 } from './services/ltbUsers';
 import {
   createLead,
@@ -45,9 +46,10 @@ import {
   countTransfersFromPool,
   countTransfersToPool,
   aggregateRecipientCounts,
+  countAllTransfers,
 } from './services/ltbTransfers';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
-import { KNOWN_BRANDS } from './brands';
+import { KNOWN_BRANDS, normalizeBrand } from './brands';
 
 import 'dotenv/config';
 
@@ -227,6 +229,17 @@ function csvFromBrandPickSet(set: Set<number>): string {
   return Array.from(set)
     .sort((a, b) => a - b)
     .join(',');
+}
+
+function brandIndicesFromUserBrands(brands: string[] | undefined): Set<number> {
+  const set = new Set<number>();
+  if (!brands?.length) return set;
+  for (const b of brands) {
+    const nb = normalizeBrand(b);
+    const idx = BRANDS.findIndex((x) => normalizeBrand(x) === nb);
+    if (idx >= 0) set.add(idx);
+  }
+  return set;
 }
 
 function roleRuForPrompt(role: UserRole): string {
@@ -546,6 +559,79 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
   await ctx.reply(lines.join('\n'));
 }
 
+/** Менеджер / админ: личные цифры + общие по базе и передачи с именами. */
+async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
+  const u = await getUser(viewerUid);
+  if (!u || !u.active || (u.role !== 'manager' && u.role !== 'admin')) {
+    await ctx.reply('Кнопка доступна менеджерам и админу.');
+    return;
+  }
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayTs = Timestamp.fromDate(todayStart);
+  const todayMs = todayTs.toMillis();
+  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  const [mine, todayAll, totalLeads, totalTransfers, weekTransfers] = await Promise.all([
+    listMyLeads(viewerUid).then((rows) => rows.length),
+    countToday(),
+    countAllLeads(),
+    countAllTransfers(),
+    listTransfersSince(weekTs, 500),
+  ]);
+
+  const xferToday = weekTransfers.filter((t) => t.createdAt.toMillis() >= todayMs);
+  const fromCounts = new Map<number, number>();
+  const toCounts = new Map<number, number>();
+  for (const t of weekTransfers) {
+    fromCounts.set(t.fromTelegramId, (fromCounts.get(t.fromTelegramId) || 0) + 1);
+    toCounts.set(t.toTelegramId, (toCounts.get(t.toTelegramId) || 0) + 1);
+  }
+  const topFrom = [...fromCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const topTo = [...toCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+
+  const linesFrom = await Promise.all(
+    topFrom.map(async ([id, c]) => `  • ${await formatTelegramShortName(id)}: ${c}`),
+  );
+  const linesTo = await Promise.all(
+    topTo.map(async ([id, c]) => `  • ${await formatTelegramShortName(id)}: ${c}`),
+  );
+
+  const parts = [
+    '📊 Моя статистика + общая',
+    '',
+    '👤 Личное:',
+    `  • У вас в работе (в списке «Мои лиды»): ${mine}`,
+    '',
+    '🌐 Общее по базе (все лиды и передачи, с начала учёта):',
+    `  • Лидов сегодня: ${todayAll}`,
+    `  • Лидов всего: ${totalLeads}`,
+    `  • Передач всего: ${totalTransfers}`,
+    '',
+    'За 7 дней (по журналу, до 500 последних записей):',
+    `  • Передач в выборке: ${weekTransfers.length}`,
+    `  • Передач сегодня (из этой выборки): ${xferToday.length}`,
+    '',
+    'Кто чаще передавал (7 дн., топ по имени):',
+    linesFrom.length ? linesFrom.join('\n') : '  —',
+    '',
+    'Кому чаще передавали (7 дн., топ по имени):',
+    linesTo.length ? linesTo.join('\n') : '  —',
+    '',
+    'Это не «с сегодняшнего дня»: берутся реальные данные Firestore.',
+  ];
+
+  const full = parts.join('\n');
+  const max = 4000;
+  if (full.length <= max) {
+    await ctx.reply(full);
+    return;
+  }
+  await ctx.reply(full.slice(0, max));
+  await ctx.reply(full.slice(max));
+}
+
 async function sendAdminLeadsDigest(ctx: Context, uid: number) {
   if (!isAdmin(uid)) {
     await ctx.reply('Нет прав.');
@@ -716,6 +802,7 @@ async function main() {
         '/admin_digest — лиды сегодня / всего + кому чаще передавали (только админ)\n' +
         '/broadcast Текст — сообщение всем manager, РОП и АТЗ (только админ)\n' +
         '/setdept <telegram_id> <отдел> — привязка РОП и менеджеров к отделу (slug, напр. changan)\n' +
+        '/editmgr <telegram_id> — сменить бренды у существующего менеджера (кнопками)\n' +
         'Кнопки «📤 Передачи», «📊 Сводка», «📌 Лиды (всего)» в меню админа\n' +
         '/lead_<id> — в разработке',
     ),
@@ -878,6 +965,7 @@ async function main() {
       s.data.pendingMgrName = name;
       s.data.pendingRole = role;
       s.data.adminBrandPick = '';
+      s.data.editBrandsOnly = false;
       const selected = new Set<number>();
       // eslint-disable-next-line no-console
       console.log('[adduser] brand wizard', { tg, name, role, uid });
@@ -903,6 +991,44 @@ async function main() {
   bot.hears(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/is, handleAdduser);
   bot.command('adduser', handleAdduser);
 
+  const handleEditmgr = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !isAdmin(uid)) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/editmgr(?:@\S+)?\s+(\d+)\s*$/i);
+    if (!m) {
+      return ctx.reply('Формат: /editmgr 123456789\nОткроется выбор брендов для существующего менеджера.');
+    }
+    const tg = parseInt(m[1]!, 10);
+    if (Number.isNaN(tg)) return ctx.reply('Неверный id.');
+    const target = await getUser(tg);
+    if (!target || target.role !== 'manager') {
+      return ctx.reply('Нужен пользователь с ролью manager. Сначала /adduser … manager …');
+    }
+    const s = sess(uid);
+    s.key = 'admin_mgr_brands';
+    s.data.pendingMgrTg = tg;
+    s.data.pendingMgrName = target.name;
+    s.data.pendingRole = 'manager';
+    s.data.editBrandsOnly = true;
+    const selected = brandIndicesFromUserBrands(target.brands);
+    s.data.adminBrandPick = csvFromBrandPickSet(selected);
+    const pr: UserRole = 'manager';
+    await ctx.reply(
+      `✏️ Редактирование брендов менеджера ${target.name} (${tg}).\n` +
+        'Текущие бренды в профиле: ' +
+        (target.brands?.length ? target.brands.join(', ') : 'не заданы (участвует во всех брендах)') +
+        '.\n\n' +
+        adminManagerBrandPrompt(tg, target.name, selected, pr) +
+        '\n\nСохранится после «Готово» или «Все бренды».',
+      { reply_markup: adminManagerBrandKb(selected).reply_markup },
+    );
+  };
+  bot.hears(/^\/editmgr(?:@\S+)?(?:\s+(.+))?$/is, handleEditmgr);
+  bot.command('editmgr', handleEditmgr);
+
   bot.on('callback_query', async (ctx) => {
     const q = ctx.callbackQuery;
     if (!q || !('data' in q) || !q.data) return;
@@ -917,7 +1043,7 @@ async function main() {
         }
         const s = sess(uid);
         if (s.key !== 'admin_mgr_brands') {
-          await ctx.answerCbQuery('Сначала выполните /adduser … без «-- …» в конце, чтобы открыть выбор брендов', {
+          await ctx.answerCbQuery('Сначала /adduser … или /editmgr <id>', {
             show_alert: true,
           });
           return;
@@ -925,7 +1051,7 @@ async function main() {
         const tg = Number(s.data.pendingMgrTg);
         const name = String(s.data.pendingMgrName || '');
         if (!Number.isFinite(tg) || !name) {
-          await ctx.answerCbQuery('Сессия сброшена, начните /adduser снова', { show_alert: true });
+          await ctx.answerCbQuery('Сессия сброшена. Начните /adduser или /editmgr', { show_alert: true });
           s.key = 'idle';
           s.data = {};
           return;
@@ -948,13 +1074,22 @@ async function main() {
             reply_markup: adminManagerBrandKb(selected).reply_markup,
           });
         }
+        const editOnly = Boolean(s.data.editBrandsOnly);
         if (d === 'adm_b:all') {
-          await setUser(tg, name, pr, []);
+          try {
+            if (editOnly) await patchUserBrands(tg, 'all');
+            else await setUser(tg, name, pr, []);
+          } catch {
+            await ctx.answerCbQuery('Ошибка сохранения', { show_alert: true });
+            return;
+          }
           s.key = 'idle';
           s.data = {};
           await ctx.answerCbQuery();
           return ctx.editMessageText(
-            `✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле не заданы (как «все» для manager).`,
+            editOnly
+              ? `✅ Бренды сброшены: ${tg} — ${name}\nТеперь как «все бренды» (универсальный менеджер).`
+              : `✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле не заданы (как «все» для manager).`,
           );
         }
         if (d === 'adm_b:done') {
@@ -965,11 +1100,21 @@ async function main() {
           const list = Array.from(selected)
             .sort((a, b) => a - b)
             .map((i) => BRANDS[i]!);
-          await setUser(tg, name, pr, list);
+          try {
+            if (editOnly) await patchUserBrands(tg, list);
+            else await setUser(tg, name, pr, list);
+          } catch {
+            await ctx.answerCbQuery('Ошибка сохранения', { show_alert: true });
+            return;
+          }
           s.key = 'idle';
           s.data = {};
           await ctx.answerCbQuery();
-          return ctx.editMessageText(`✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле: ${list.join(', ')}`);
+          return ctx.editMessageText(
+            editOnly
+              ? `✅ Бренды обновлены: ${name} (${tg})\n${list.join(', ')}`
+              : `✅ Ок. ${tg} — ${pr}, ${name}\nБренды в профиле: ${list.join(', ')}`,
+          );
         }
         await ctx.answerCbQuery();
         return;
@@ -1652,9 +1797,7 @@ async function main() {
       return;
     }
     if (text === '📊 Моя статистика') {
-      const n = await countToday();
-      const mine = (await listMyLeads(uid)).length;
-      return ctx.reply(`Ваши активные в списке: ${mine}\nСегодня (все): ${n} нов.`);
+      return sendStaffStatsBoard(ctx, uid);
     }
     if (text === '📋 Клиенты за сегодня' && (await getUser(uid))?.role === 'atz') {
       return ctx.reply(`Сегодня: ${await countToday()} заявок (все ltb-лиды).`);

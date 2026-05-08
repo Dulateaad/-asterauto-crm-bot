@@ -176,6 +176,22 @@ export async function updateUserDepartment(telegramId: number, departmentId: str
   await ref.update({ departmentId: normalizeDepartmentId(departmentId), updatedAt: now });
 }
 
+/** Только бренды менеджера (или снять список = «все бренды»). */
+export async function patchUserBrands(telegramId: number, brands: string[] | 'all'): Promise<void> {
+  const ref = db().collection(C.users).doc(String(telegramId));
+  const now = Timestamp.now();
+  const prev = await ref.get();
+  if (!prev.exists) throw new Error('NO_USER_DOC');
+  if (brands === 'all') {
+    await ref.update({ brands: FieldValue.delete(), updatedAt: now });
+    return;
+  }
+  await ref.update({
+    brands: brands.map((b) => normalizeBrand(b)),
+    updatedAt: now,
+  });
+}
+
 /** Менеджеры отдела (по полю departmentId). */
 export async function listManagerTgIdsInDepartment(departmentId: string): Promise<number[]> {
   const norm = normalizeDepartmentId(departmentId);

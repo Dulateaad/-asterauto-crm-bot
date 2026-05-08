@@ -75,3 +75,8 @@ export async function aggregateRecipientCounts(limit = 500): Promise<Map<number,
   }
   return m;
 }
+
+export async function countAllTransfers(): Promise<number> {
+  const snap = await db().collection(C.transfers).count().get();
+  return snap.data().count;
+}
