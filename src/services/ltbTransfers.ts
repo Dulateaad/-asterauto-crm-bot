@@ -80,3 +80,11 @@ export async function countAllTransfers(): Promise<number> {
   const snap = await db().collection(C.transfers).count().get();
   return snap.data().count;
 }
+
+/** Передачи, где участвует хотя бы один менеджер из пула (отправитель или получатель). */
+export function filterTransfersInvolvingPool(
+  rows: (TransferDoc & { id: string })[],
+  pool: Set<number>,
+): (TransferDoc & { id: string })[] {
+  return rows.filter((t) => pool.has(t.fromTelegramId) || pool.has(t.toTelegramId));
+}

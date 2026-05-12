@@ -295,6 +295,12 @@ export async function countAllLeads(): Promise<number> {
   return snap.data().count;
 }
 
+/** Сколько лидов сейчас назначено на менеджера (все статусы). */
+export async function countLeadsAssignedTo(managerTg: number): Promise<number> {
+  const snap = await db().collection(C.leads).where('assignedTo', '==', managerTg).count().get();
+  return snap.data().count;
+}
+
 /** Лиды покупателей из Telegram, которым пора отправить первый вопрос опроса. */
 export async function listLeadsNeedingBuyerSurveyVisit(
   minAgeMs: number,

@@ -36,6 +36,7 @@ import {
   countLeadsOnLocalCalendarDay,
   countLeadsOnLocalDayForAssignedPool,
   countAllLeads,
+  countLeadsAssignedTo,
   slaClockMillis,
   type LeadDoc,
 } from './services/ltbLeads';
@@ -49,6 +50,7 @@ import {
   countTransfersToPool,
   aggregateRecipientCounts,
   countAllTransfers,
+  filterTransfersInvolvingPool,
 } from './services/ltbTransfers';
 import type { Session, TransferReasonId, TransferTargetId, UserRole } from './types';
 import { KNOWN_BRANDS, normalizeBrand } from './brands';
@@ -517,30 +519,119 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   await ctx.reply(full.slice(max));
 }
 
-async function sendRopDepartmentStats(ctx: Context, uid: number) {
+/** РОП + departmentId + менеджеры отдела; иначе null (уже ответили в чат). */
+async function getRopDepartmentContext(
+  ctx: Context,
+  uid: number,
+): Promise<{ dept: string; pool: Set<number>; mgrIds: number[] } | null> {
   const u = await getUser(uid);
   if (!u || u.role !== 'rop') {
     await ctx.reply('Раздел только для РОП.');
-    return;
+    return null;
   }
   const rawDept = u.departmentId?.trim();
   if (!rawDept) {
     await ctx.reply(
       'У вашей учётной записи не задан отдел.\n' +
-        `Попросите админа выполнить, например:\n/setdept ${uid} changan\n` +
-        'и тем же ключом привязать менеджеров:\n/setdept <telegram_менеджера> changan',
+        `Попросите админа: /setdept ${uid} <ключ_отдела>\n` +
+        'и тем же ключом привязать менеджеров.',
     );
-    return;
+    return null;
   }
   const dept = normalizeDepartmentId(rawDept);
   const mgrIds = await listManagerTgIdsInDepartment(dept);
   if (mgrIds.length === 0) {
     await ctx.reply(
-      `Отдел «${dept}»: пока нет менеджеров с таким departmentId. Админ: /setdept <tg_менеджера> ${dept}`,
+      `Отдел «${dept}»: нет менеджеров с таким departmentId. Админ: /setdept <tg_менеджера> ${dept}`,
     );
+    return null;
+  }
+  return { dept, pool: new Set(mgrIds), mgrIds };
+}
+
+async function sendRopDepartmentTransfers(ctx: Context, uid: number) {
+  const ctxDept = await getRopDepartmentContext(ctx, uid);
+  if (!ctxDept) return;
+  const { pool } = ctxDept;
+  const weekTs = Timestamp.fromMillis(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const all = await listTransfersSince(weekTs, 600);
+  const rows = filterTransfersInvolvingPool(all, pool).slice(0, 35);
+  if (rows.length === 0) {
+    await ctx.reply('За 7 дней нет передач с участием менеджеров вашего отдела (в выборке).');
     return;
   }
-  const pool = new Set(mgrIds);
+  const parts: string[] = [
+    `📤 Передачи отдела (последние ${rows.length} за 7 дн., где участвует ваш отдел):`,
+    '',
+  ];
+  for (let i = 0; i < rows.length; i++) {
+    const t = rows[i]!;
+    const [fromL, toL, leadSnap] = await Promise.all([
+      formatTelegramShortName(t.fromTelegramId),
+      formatTelegramShortName(t.toTelegramId),
+      getLead(t.leadId),
+    ]);
+    const who = leadSnap?.fio?.trim() || `лид #${t.leadId}`;
+    parts.push(
+      `${i + 1}. ${who}\n` +
+        `   От: ${fromL}\n` +
+        `   Кому: ${toL}\n` +
+        `   ${transferReasonLabel(t.reason)} → ${transferTargetLabel(t.target)}`,
+    );
+    if (t.comment.trim()) {
+      const c = t.comment.trim();
+      parts.push(`   💬 ${c.length > 120 ? `${c.slice(0, 120)}…` : c}`);
+    }
+    parts.push('');
+  }
+  const full = parts.join('\n').trim();
+  const max = 4000;
+  if (full.length <= max) {
+    await ctx.reply(full);
+    return;
+  }
+  await ctx.reply(full.slice(0, max) + '\n…');
+}
+
+async function sendRopManagersBoard(ctx: Context, uid: number) {
+  const ctxDept = await getRopDepartmentContext(ctx, uid);
+  if (!ctxDept) return;
+  const { dept, mgrIds, pool } = ctxDept;
+  const weekTs = Timestamp.fromMillis(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const xferWeek = await listTransfersSince(weekTs, 600);
+  const outM = new Map<number, number>();
+  const inM = new Map<number, number>();
+  for (const t of xferWeek) {
+    if (pool.has(t.fromTelegramId)) {
+      outM.set(t.fromTelegramId, (outM.get(t.fromTelegramId) || 0) + 1);
+    }
+    if (pool.has(t.toTelegramId)) {
+      inM.set(t.toTelegramId, (inM.get(t.toTelegramId) || 0) + 1);
+    }
+  }
+  const assigned = await Promise.all(mgrIds.map((id) => countLeadsAssignedTo(id)));
+  const names = await Promise.all(mgrIds.map((id) => formatTelegramShortName(id)));
+  const lines = [
+    `👥 Отдел «${dept}» — по менеджерам`,
+    '',
+    'За 7 дней (передачи, где участвует менеджер отдела):',
+    '«В работе» — сколько лидов сейчас назначено на менеджера.',
+    '',
+  ];
+  for (let i = 0; i < mgrIds.length; i++) {
+    const id = mgrIds[i]!;
+    lines.push(
+      `  • ${names[i]}:\n` +
+        `    отдал: ${outM.get(id) || 0}  |  принял: ${inM.get(id) || 0}  |  в работе: ${assigned[i]}`,
+    );
+  }
+  await ctx.reply(lines.join('\n'));
+}
+
+async function sendRopDepartmentStats(ctx: Context, uid: number) {
+  const ctxDept = await getRopDepartmentContext(ctx, uid);
+  if (!ctxDept) return;
+  const { dept, pool, mgrIds } = ctxDept;
   const now = new Date();
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
@@ -560,6 +651,19 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
   const outWeek = countTransfersFromPool(xferWeek, pool);
   const inWeek = countTransfersToPool(xferWeek, pool);
 
+  const outM = new Map<number, number>();
+  const inM = new Map<number, number>();
+  for (const t of xferWeek) {
+    if (pool.has(t.fromTelegramId)) {
+      outM.set(t.fromTelegramId, (outM.get(t.fromTelegramId) || 0) + 1);
+    }
+    if (pool.has(t.toTelegramId)) {
+      inM.set(t.toTelegramId, (inM.get(t.toTelegramId) || 0) + 1);
+    }
+  }
+  const assigned = await Promise.all(mgrIds.map((id) => countLeadsAssignedTo(id)));
+  const names = await Promise.all(mgrIds.map((id) => formatTelegramShortName(id)));
+
   const lines = [
     `📊 Отдел: ${dept}`,
     `Менеджеров в отделе: ${mgrIds.length}`,
@@ -576,8 +680,18 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
     `  • Передач из отдела: ${outWeek}`,
     `  • Передач в отдел: ${inWeek}`,
     '',
-    'Пояснение: лиды — среди созданных за период, назначенные на менеджеров отдела (скан до 600). Передачи — журнал за 7 дней (до 600 записей).',
+    '👥 По менеджерам (7 дн. передачи; «в работе» — лиды на менеджере сейчас):',
   ];
+  for (let i = 0; i < mgrIds.length; i++) {
+    const id = mgrIds[i]!;
+    lines.push(
+      `  • ${names[i]}: отдал ${outM.get(id) || 0}, принял ${inM.get(id) || 0}, в работе ${assigned[i]}`,
+    );
+  }
+  lines.push(
+    '',
+    'Пояснение: лиды по дням — скан до 600–800. Передачи — журнал за 7 дней (до 600). Подробный список: кнопка «🔄 Передачи».',
+  );
   await ctx.reply(lines.join('\n'));
 }
 
@@ -825,7 +939,10 @@ async function main() {
   bot.command('help', (ctx) =>
     ctx.reply(
       'Покупатель: /start — заявка на авто, бренд и контакты; позже — короткий опрос и рассылки по согласию.\n\n' +
-        'РОП:\n«📊 Статистика» — сводка по отделу (у РОП и менеджеров в Firestore одинаковый отдел; задаёт админ: /setdept).\n\n' +
+        'РОП:\n«📊 Статистика» — сводка по отделу + по менеджерам (нужен /setdept).\n' +
+        '«🔄 Передачи» — кто кому передал лидов в отделе (7 дн.).\n' +
+        '«👥 По менеджерам» — отдал / принял / в работе по каждому.\n' +
+        '/rop_transfers — то же, что кнопка передач.\n\n' +
         'Админ:\n/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
@@ -844,6 +961,16 @@ async function main() {
     const uid = ctx.from?.id;
     if (!uid) return;
     await sendAdminTransfersReport(ctx, uid);
+  });
+
+  bot.command('rop_transfers', async (ctx) => {
+    const uid = ctx.from?.id;
+    if (!uid) return;
+    const u = await getUser(uid);
+    if (!u || u.role !== 'rop') {
+      return ctx.reply('Команда только для РОП.');
+    }
+    await sendRopDepartmentTransfers(ctx, uid);
   });
 
   bot.command('admin_digest', async (ctx) => {
@@ -1846,15 +1973,21 @@ async function main() {
         'Список ожидающих клиентов — в следующей версии. Пока используйте «Клиенты за сегодня» и лиды у менеджеров.',
       );
     }
-    if (text === '📋 Все лиды' || text === '⏰ Просроченные' || text === '👥 По менеджерам') {
+    if (text === '👥 По менеджерам') {
       if ((await getUser(uid))?.role !== 'rop') return;
-      return ctx.reply(
-        'Раздел в разработке. Сводка по отделу: кнопка «📊 Статистика» (нужен /setdept у админа).',
-      );
+      return sendRopManagersBoard(ctx, uid);
     }
-    if (text === '🔄 Передачи' || text === '⚙️ Настройки') {
+    if (text === '📋 Все лиды' || text === '⏰ Просроченные') {
       if ((await getUser(uid))?.role !== 'rop') return;
-      return ctx.reply('Раздел в разработке (MVP).');
+      return ctx.reply('Раздел в разработке.');
+    }
+    if (text === '🔄 Передачи') {
+      if ((await getUser(uid))?.role !== 'rop') return;
+      return sendRopDepartmentTransfers(ctx, uid);
+    }
+    if (text === '⚙️ Настройки') {
+      if ((await getUser(uid))?.role !== 'rop') return;
+      return ctx.reply('Отдел задаёт админ: /setdept. Остальное — в разработке.');
     }
     if (text === '📤 Передачи (кто кому)') {
       if (!isAdmin(uid)) return;
