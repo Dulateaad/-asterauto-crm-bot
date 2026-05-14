@@ -1,5 +1,3 @@
-import { Timestamp } from 'firebase-admin/firestore';
-
 export type UserRole =
   | 'manager' // менеджер продаж, очередь лидов по брендам
   | 'atz' // АТЗ — администратор торгового зала (приём клиентов, регистрация лидов)

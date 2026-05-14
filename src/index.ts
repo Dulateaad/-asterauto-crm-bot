@@ -1,8 +1,7 @@
 import { Markup } from 'telegraf';
 import { config } from './config';
-import { initFirebase, getActiveFirebaseProjectId } from './firebase';
+import { initDb, databaseUrlHostSummary } from './db';
 import { Telegraf, type Context } from 'telegraf';
-import { Timestamp } from 'firebase-admin/firestore';
 import {
   getUser,
   isAdmin,
@@ -130,7 +129,7 @@ function atzConfirmSummary(s: Session) {
   );
 }
 
-/** Новые лиды без опроса оплаты/бюджета — технические поля для Firestore */
+/** Новые лиды без опроса оплаты/бюджета — технические поля для БД */
 const DEFAULT_LEAD_PAYMENT = 'cash' as const;
 
 function leadNotifyBody(leadId: string, fio: string, phone: string, brand: string) {
@@ -355,7 +354,7 @@ async function runCustomerSurveyBot(bot: Telegraf) {
 async function sendMain(ctx: Context, uid: number) {
   try {
     let u = await getUser(uid);
-    // Первый вход: ID в BOT_ADMIN_IDS, но ещё нет документа в ltbUsers — создаём admin
+    // Первый вход: ID в BOT_ADMIN_IDS, но ещё нет строки в ltb_users — создаём admin
     if (!u && isAdmin(uid)) {
       const label =
         [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') ||
@@ -384,15 +383,14 @@ async function sendMain(ctx: Context, uid: number) {
     await ctx.reply(`🏠 Главное меню (${label})`, { reply_markup: mk.reply_markup });
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.error('sendMain / Firestore:', e);
-    const grpc = e as { code?: number; details?: string };
-    const isDenied = grpc.code === 7 || String(grpc.details || '').includes('PERMISSION_DENIED');
-    const isQuota = grpc.code === 8 || String(grpc.details || '').includes('Quota exceeded');
-    const hint = isDenied
-      ? 'Доступ к Firestore запрещён (IAM). В Google Cloud Console → IAM для проекта ключа выдайте этому сервисному аккаунту роль «Cloud Datastore User» или «Editor». Убедитесь, что в Firebase для этого проекта включён Firestore, а JSON ключ скачан из того же проекта.'
-      : isQuota
-        ? 'Превышена квота Firestore (RESOURCE_EXHAUSTED). Оставьте один экземпляр бота на Render; в Environment задайте BOT_DISABLE_BACKGROUND_POLL=1 и BOT_POLLER_INTERVAL_MS=300000, перезапустите сервис. В Google Cloud → Quotas проверьте лимиты Firestore.'
-        : 'На Render проверьте FIREBASE_SERVICE_ACCOUNT_JSON (полный JSON) и что Firestore включён в Firebase Console.';
+    console.error('sendMain / DB:', e);
+    const pg = e as { code?: string; message?: string };
+    const hint =
+      pg.code === 'ECONNREFUSED' || pg.code === 'ENOTFOUND'
+        ? 'Не удаётся подключиться к PostgreSQL. Проверьте DATABASE_URL, что Postgres запущен на VPS и порт открыт локально / с Render.'
+        : pg.code === '28P01' || pg.code === '28000'
+          ? 'Ошибка авторизации к PostgreSQL (логин/пароль в DATABASE_URL).'
+          : 'Проверьте DATABASE_URL и что выполнен миграционный скрипт: npm run db:migrate';
     await ctx.reply('Не удалось связаться с базой.\n' + hint);
   }
 }
@@ -445,15 +443,14 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
   const now = new Date();
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
-  const todayTs = Timestamp.fromDate(todayStart);
-  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
   const [mapToday, mapWeek, ydayTotal, y2Total, transfers, managers] = await Promise.all([
-    countLeadsByBrandSince(todayTs),
-    countLeadsByBrandSince(weekTs),
+    countLeadsByBrandSince(todayStart),
+    countLeadsByBrandSince(weekStart),
     countLeadsOnLocalCalendarDay(1),
     countLeadsOnLocalCalendarDay(2),
-    listTransfersSince(weekTs, 400),
+    listTransfersSince(weekStart, 400),
     listActiveManagersDetailed(),
   ]);
 
@@ -498,10 +495,10 @@ async function sendAdminStatsSummary(ctx: Context, uid: number) {
     `  • Вчера (${ruLocalDateLabel(1)}): ${ydayTotal}`,
     `  • Позавчера (${ruLocalDateLabel(2)}): ${y2Total}`,
     '',
-    'Сегодня (с полуночи, по брендам; до 500 лидов в выборке):',
+    'Сегодня (с полуночи, по брендам):',
     sortBrandLines(mapToday),
     '',
-    'За 7 дней (агрегация по бренду; в Firestore до 500 лидов в выборке):',
+    'За 7 дней (агрегация по бренду):',
     sortBrandLines(mapWeek),
     '',
     `📤 Исходящие передачи за 7 дней: всего ${transfers.length}`,
@@ -556,8 +553,8 @@ async function sendRopDepartmentTransfers(ctx: Context, uid: number) {
   const ctxDept = await getRopDepartmentContext(ctx, uid);
   if (!ctxDept) return;
   const { pool } = ctxDept;
-  const weekTs = Timestamp.fromMillis(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const all = await listTransfersSince(weekTs, 600);
+  const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const all = await listTransfersSince(weekStart, 600);
   const rows = filterTransfersInvolvingPool(all, pool).slice(0, 35);
   if (rows.length === 0) {
     await ctx.reply('За 7 дней нет передач с участием менеджеров вашего отдела (в выборке).');
@@ -600,8 +597,8 @@ async function sendRopManagersBoard(ctx: Context, uid: number) {
   const ctxDept = await getRopDepartmentContext(ctx, uid);
   if (!ctxDept) return;
   const { dept, mgrIds, pool } = ctxDept;
-  const weekTs = Timestamp.fromMillis(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const xferWeek = await listTransfersSince(weekTs, 600);
+  const weekStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const xferWeek = await listTransfersSince(weekStart, 600);
   const outM = new Map<number, number>();
   const inM = new Map<number, number>();
   for (const t of xferWeek) {
@@ -638,17 +635,16 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
   const now = new Date();
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
-  const todayTs = Timestamp.fromDate(todayStart);
-  const todayMs = todayTs.toMillis();
-  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const todayMs = todayStart.getTime();
+  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const [leadsToday, leadsYday, leadsY2, leadsWeek, xferWeek] = await Promise.all([
-    countLeadsSinceForAssignedPool(pool, todayTs, 600),
+    countLeadsSinceForAssignedPool(pool, todayStart, 600),
     countLeadsOnLocalDayForAssignedPool(pool, 1, 800),
     countLeadsOnLocalDayForAssignedPool(pool, 2, 800),
-    countLeadsSinceForAssignedPool(pool, weekTs, 600),
-    listTransfersSince(weekTs, 600),
+    countLeadsSinceForAssignedPool(pool, weekStart, 600),
+    listTransfersSince(weekStart, 600),
   ]);
-  const xferToday = xferWeek.filter((t) => t.createdAt.toMillis() >= todayMs);
+  const xferToday = xferWeek.filter((t) => t.createdAt.getTime() >= todayMs);
   const outToday = countTransfersFromPool(xferToday, pool);
   const inToday = countTransfersToPool(xferToday, pool);
   const outWeek = countTransfersFromPool(xferWeek, pool);
@@ -671,7 +667,7 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
     `📊 Отдел: ${dept}`,
     `Менеджеров в отделе: ${mgrIds.length}`,
     '',
-    'Новые лиды на команду по дням (назначение на менеджеров отдела, лимит скана):',
+    'Новые лиды на команду по дням (назначение на менеджеров отдела):',
     `  • Сегодня: ${leadsToday}`,
     `  • Вчера (${ruLocalDateLabel(1)}): ${leadsYday}`,
     `  • Позавчера (${ruLocalDateLabel(2)}): ${leadsY2}`,
@@ -679,7 +675,7 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
     `  • Передач в отдел: ${inToday}`,
     '',
     'За 7 дней:',
-    `  • Новых лидов на команду (лимит скана): ${leadsWeek}`,
+    `  • Новых лидов на команду: ${leadsWeek}`,
     `  • Передач из отдела: ${outWeek}`,
     `  • Передач в отдел: ${inWeek}`,
     '',
@@ -693,7 +689,7 @@ async function sendRopDepartmentStats(ctx: Context, uid: number) {
   }
   lines.push(
     '',
-    'Пояснение: лиды по дням — скан до 600–800. Передачи — журнал за 7 дней (до 600). Подробный список: кнопка «🔄 Передачи».',
+    'Пояснение: передачи — журнал за 7 дней (до 600 записей в выборке). Подробный список: кнопка «🔄 Передачи».',
   );
   await ctx.reply(lines.join('\n'));
 }
@@ -708,9 +704,8 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
   const now = new Date();
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
-  const todayTs = Timestamp.fromDate(todayStart);
-  const todayMs = todayTs.toMillis();
-  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const todayMs = todayStart.getTime();
+  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
   const [mine, todayAll, leadsYday, leadsY2, totalLeads, totalTransfers, weekTransfers] = await Promise.all([
     listMyLeads(viewerUid).then((rows) => rows.length),
@@ -719,10 +714,10 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
     countLeadsOnLocalCalendarDay(2),
     countAllLeads(),
     countAllTransfers(),
-    listTransfersSince(weekTs, 500),
+    listTransfersSince(weekStart, 500),
   ]);
 
-  const xferToday = weekTransfers.filter((t) => t.createdAt.toMillis() >= todayMs);
+  const xferToday = weekTransfers.filter((t) => t.createdAt.getTime() >= todayMs);
   const fromCounts = new Map<number, number>();
   const toCounts = new Map<number, number>();
   for (const t of weekTransfers) {
@@ -763,7 +758,7 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
     'Кому чаще передавали (7 дн., топ по имени):',
     linesTo.length ? linesTo.join('\n') : '  —',
     '',
-    'Это не «с сегодняшнего дня»: берутся реальные данные Firestore.',
+    'Это не «с сегодняшнего дня»: берутся реальные данные из PostgreSQL.',
   ];
 
   const full = parts.join('\n');
@@ -784,14 +779,13 @@ async function sendAdminLeadsDigest(ctx: Context, uid: number) {
   const now = new Date();
   const todayStart = new Date(now);
   todayStart.setHours(0, 0, 0, 0);
-  const todayTs = Timestamp.fromDate(todayStart);
-  const weekTs = Timestamp.fromMillis(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const [todayCount, ydayCount, y2Count, total, weekTransfers, recMap] = await Promise.all([
-    countLeadsSince(todayTs),
+    countLeadsSince(todayStart),
     countLeadsOnLocalCalendarDay(1),
     countLeadsOnLocalCalendarDay(2),
     countAllLeads(),
-    listTransfersSince(weekTs, 500),
+    listTransfersSince(weekStart, 500),
     aggregateRecipientCounts(400),
   ]);
   const topRecv = [...recMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
@@ -913,7 +907,7 @@ function resolveWebhookPublicBase(): string | undefined {
 }
 
 async function main() {
-  initFirebase();
+  initDb();
   if (!config.token) {
     throw new Error('TELEGRAM_BOT_TOKEN обязателен');
   }
@@ -1032,7 +1026,7 @@ async function main() {
       await updateUserDepartment(tg, token);
       return ctx.reply(`Ок. Пользователь ${tg} (${target.role}) → отдел «${normalizeDepartmentId(token)}».`);
     } catch {
-      return ctx.reply('Не удалось сохранить. Проверьте Firestore.');
+      return ctx.reply('Не удалось сохранить. Проверьте подключение к PostgreSQL.');
     }
   };
   bot.hears(/^\/setdept(?:@\S+)?(?:\s+(.+))?$/is, handleSetdept);
@@ -2021,7 +2015,7 @@ async function main() {
 
   if (config.disableBackgroundPoll) {
     // eslint-disable-next-line no-console
-    console.warn('[bot] BOT_DISABLE_BACKGROUND_POLL: фоновые опросы Firestore отключены (SLA и опрос покупателя).');
+    console.warn('[bot] BOT_DISABLE_BACKGROUND_POLL: фоновые опросы БД отключены (SLA и опрос покупателя).');
   } else {
     setInterval(() => {
       runSlaBot(bot).catch(() => null);
@@ -2033,7 +2027,7 @@ async function main() {
 
   const me = await bot.telegram.getMe();
   // eslint-disable-next-line no-console
-  console.log('Telegram:', '@' + (me.username || '?'), '| Firebase:', getActiveFirebaseProjectId());
+  console.log('Telegram:', '@' + (me.username || '?'), '| DB:', databaseUrlHostSummary());
 
   process.once('SIGINT', () => bot.stop('SIGINT'));
   process.once('SIGTERM', () => bot.stop('SIGTERM'));

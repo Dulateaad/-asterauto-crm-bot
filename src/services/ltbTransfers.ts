@@ -1,9 +1,5 @@
-import { getDb } from '../firebase';
-import { C } from '../collections';
-import { Timestamp } from 'firebase-admin/firestore';
+import { getPool } from '../db';
 import type { TransferReasonId, TransferTargetId } from '../types';
-
-const db = () => getDb();
 
 export type TransferDoc = {
   leadId: string;
@@ -12,8 +8,32 @@ export type TransferDoc = {
   reason: TransferReasonId;
   target: TransferTargetId;
   comment: string;
-  createdAt: Timestamp;
+  createdAt: Date;
 };
+
+type TransferRow = {
+  id: string;
+  lead_id: string;
+  from_telegram_id: string;
+  to_telegram_id: string;
+  reason: string;
+  target: string;
+  comment: string;
+  created_at: Date;
+};
+
+function rowToTransfer(r: TransferRow): TransferDoc & { id: string } {
+  return {
+    id: String(r.id),
+    leadId: r.lead_id,
+    fromTelegramId: Number(r.from_telegram_id),
+    toTelegramId: Number(r.to_telegram_id),
+    reason: r.reason as TransferReasonId,
+    target: r.target as TransferTargetId,
+    comment: r.comment,
+    createdAt: r.created_at,
+  };
+}
 
 const REASON_LABEL: Record<TransferReasonId, string> = {
   high_price: 'Высокая цена',
@@ -40,21 +60,21 @@ export function transferTargetLabel(id: TransferTargetId): string {
 }
 
 export async function listRecentTransfers(limit = 40): Promise<(TransferDoc & { id: string })[]> {
-  const q = await db().collection(C.transfers).orderBy('createdAt', 'desc').limit(limit).get();
-  return q.docs.map((d) => ({ id: d.id, ...(d.data() as TransferDoc) }));
+  const pool = getPool();
+  const { rows } = await pool.query<TransferRow>(
+    `SELECT * FROM ltb_transfers ORDER BY created_at DESC LIMIT $1`,
+    [limit],
+  );
+  return rows.map(rowToTransfer);
 }
 
-export async function listTransfersSince(
-  since: Timestamp,
-  limit = 400,
-): Promise<(TransferDoc & { id: string })[]> {
-  const q = await db()
-    .collection(C.transfers)
-    .where('createdAt', '>=', since)
-    .orderBy('createdAt', 'desc')
-    .limit(limit)
-    .get();
-  return q.docs.map((d) => ({ id: d.id, ...(d.data() as TransferDoc) }));
+export async function listTransfersSince(since: Date, limit = 400): Promise<(TransferDoc & { id: string })[]> {
+  const pool = getPool();
+  const { rows } = await pool.query<TransferRow>(
+    `SELECT * FROM ltb_transfers WHERE created_at >= $1 ORDER BY created_at DESC LIMIT $2`,
+    [since, limit],
+  );
+  return rows.map(rowToTransfer);
 }
 
 export function countTransfersFromPool(rows: (TransferDoc & { id: string })[], fromIds: Set<number>): number {
@@ -65,23 +85,28 @@ export function countTransfersToPool(rows: (TransferDoc & { id: string })[], toI
   return rows.reduce((acc, t) => acc + (toIds.has(t.toTelegramId) ? 1 : 0), 0);
 }
 
-/** Сколько раз лид попадал к получателю (по последним limit передачам, новые сверху). */
 export async function aggregateRecipientCounts(limit = 500): Promise<Map<number, number>> {
-  const q = await db().collection(C.transfers).orderBy('createdAt', 'desc').limit(limit).get();
+  const pool = getPool();
+  const { rows } = await pool.query<{ to_telegram_id: string; c: string }>(
+    `SELECT to_telegram_id::text, COUNT(*)::text AS c FROM (
+       SELECT to_telegram_id FROM ltb_transfers ORDER BY created_at DESC LIMIT $1
+     ) t
+     GROUP BY to_telegram_id`,
+    [limit],
+  );
   const m = new Map<number, number>();
-  for (const d of q.docs) {
-    const to = (d.data() as TransferDoc).toTelegramId;
-    m.set(to, (m.get(to) || 0) + 1);
+  for (const r of rows) {
+    m.set(parseInt(r.to_telegram_id, 10), parseInt(r.c, 10));
   }
   return m;
 }
 
 export async function countAllTransfers(): Promise<number> {
-  const snap = await db().collection(C.transfers).count().get();
-  return snap.data().count;
+  const pool = getPool();
+  const { rows } = await pool.query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM ltb_transfers`);
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
-/** Передачи, где участвует хотя бы один менеджер из пула (отправитель или получатель). */
 export function filterTransfersInvolvingPool(
   rows: (TransferDoc & { id: string })[],
   pool: Set<number>,

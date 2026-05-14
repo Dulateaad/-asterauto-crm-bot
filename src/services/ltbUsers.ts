@@ -1,28 +1,40 @@
-import { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { C, SETTINGS_DOC } from '../collections';
+import type { PoolClient } from 'pg';
+import { SETTINGS_DOC } from '../collections';
 import { config } from '../config';
-import { getDb } from '../firebase';
+import { getPool } from '../db';
 import { normalizeBrand } from '../brands';
 import type { UserRole } from '../types';
-
-const db = () => getDb();
 
 export type LtbUserDoc = {
   id: string;
   name: string;
   role: UserRole;
   active: boolean;
-  /**
-   * Одинаковый slug у РОП и его менеджеров — сводка «по отделу» в боте.
-   * Задаётся админом: /setdept &lt;telegram_id&gt; &lt;slug&gt;
-   */
   departmentId?: string;
-  /**
-   * Для manager: если задано и не пусто — лид только по этим брендам; иначе менеджер в пуле «на все бренды».
-   * Для rop / atz (админ зала) / admin: только в профиле; очередь лидов (`getNextManagerTelegramId`) — только manager.
-   */
   brands?: string[];
 };
+
+type UserRow = {
+  telegram_id: string;
+  name: string;
+  role: string;
+  active: boolean;
+  department_id: string | null;
+  brands: string[] | null;
+};
+
+function rowToUser(r: UserRow): LtbUserDoc {
+  const id = String(r.telegram_id);
+  const brands = r.brands;
+  return {
+    id,
+    name: r.name,
+    role: r.role as UserRole,
+    active: r.active,
+    ...(r.department_id ? { departmentId: r.department_id } : {}),
+    ...(brands != null && brands.length > 0 ? { brands } : {}),
+  };
+}
 
 export function normalizeDepartmentId(raw: string): string {
   return raw
@@ -34,10 +46,13 @@ export function normalizeDepartmentId(raw: string): string {
 }
 
 export async function getUser(telegramId: number): Promise<LtbUserDoc | null> {
-  const ref = db().collection(C.users).doc(String(telegramId));
-  const s = await ref.get();
-  if (!s.exists) return null;
-  return { id: s.id, ...s.data() } as LtbUserDoc;
+  const pool = getPool();
+  const { rows } = await pool.query<UserRow>(
+    `SELECT telegram_id, name, role, active, department_id, brands FROM ltb_users WHERE telegram_id = $1`,
+    [telegramId],
+  );
+  const r = rows[0];
+  return r ? rowToUser(r) : null;
 }
 
 export async function setUser(
@@ -46,53 +61,85 @@ export async function setUser(
   role: UserRole,
   brands?: string[],
 ): Promise<void> {
-  const ref = db().collection(C.users).doc(String(telegramId));
-  const now = Timestamp.now();
-  const prev = await ref.get();
-  const payload: Record<string, unknown> = {
-    name,
-    role,
-    active: true,
-    updatedAt: now,
-    createdAt: prev.exists ? (prev.data()?.createdAt as Timestamp) : now,
-  };
-  if (brands !== undefined) {
-    if (brands.length === 0) {
-      payload.brands = FieldValue.delete();
-    } else {
-      payload.brands = brands.map((b) => normalizeBrand(b));
-    }
+  const pool = getPool();
+  if (brands === undefined) {
+    await pool.query(
+      `INSERT INTO ltb_users (telegram_id, name, role, active, updated_at)
+       VALUES ($1, $2, $3, true, now())
+       ON CONFLICT (telegram_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         role = EXCLUDED.role,
+         active = true,
+         updated_at = now()`,
+      [telegramId, name, role],
+    );
+    return;
   }
-  await ref.set(payload, { merge: true });
+  const bnorm = brands.length === 0 ? null : brands.map((b) => normalizeBrand(b));
+  await pool.query(
+    `INSERT INTO ltb_users (telegram_id, name, role, active, brands, updated_at)
+     VALUES ($1, $2, $3, true, $4, now())
+     ON CONFLICT (telegram_id) DO UPDATE SET
+       name = EXCLUDED.name,
+       role = EXCLUDED.role,
+       active = true,
+       brands = EXCLUDED.brands,
+       updated_at = now()`,
+    [telegramId, name, role, bnorm],
+  );
 }
 
 export async function listActiveManagers(): Promise<number[]> {
-  const q = await db()
-    .collection(C.users)
-    .where('role', '==', 'manager')
-    .where('active', '==', true)
-    .get();
-  return q.docs.map((d) => parseInt(d.id, 10));
+  const pool = getPool();
+  const { rows } = await pool.query<{ telegram_id: string }>(
+    `SELECT telegram_id FROM ltb_users WHERE role = 'manager' AND active = true ORDER BY telegram_id`,
+  );
+  return rows.map((r) => parseInt(r.telegram_id, 10));
 }
 
 export async function listActiveManagersDetailed(): Promise<LtbUserDoc[]> {
-  const q = await db()
-    .collection(C.users)
-    .where('role', '==', 'manager')
-    .where('active', '==', true)
-    .get();
-  return q.docs.map((d) => ({ id: d.id, ...d.data() }) as LtbUserDoc);
+  const pool = getPool();
+  const { rows } = await pool.query<UserRow>(
+    `SELECT telegram_id, name, role, active, department_id, brands
+     FROM ltb_users WHERE role = 'manager' AND active = true ORDER BY telegram_id`,
+  );
+  return rows.map(rowToUser);
+}
+
+async function listActiveManagersDetailedTx(c: PoolClient): Promise<LtbUserDoc[]> {
+  const { rows } = await c.query<UserRow>(
+    `SELECT telegram_id, name, role, active, department_id, brands
+     FROM ltb_users WHERE role = 'manager' AND active = true ORDER BY telegram_id`,
+  );
+  return rows.map(rowToUser);
 }
 
 /**
- * Назначение менеджера на лид по бренду.
- * 1) Только менеджеры, у кого в `brands` есть этот бренд (round-robin внутри группы).
- * 2) Иначе — менеджеры без списка брендов («универсальные»).
- * 3) Иначе — все активные менеджеры (как раньше).
+ * Назначение менеджера на лид по бренду (round-robin в ltb_settings).
+ * Если передан `client`, вызывать только внутри уже открытой транзакции (BEGIN).
  */
-export async function getNextManagerTelegramId(leadBrand: string): Promise<number | null> {
+export async function getNextManagerTelegramId(leadBrand: string, client?: PoolClient): Promise<number | null> {
+  if (client) {
+    return pickNextManagerInternal(leadBrand, client);
+  }
+  const pool = getPool();
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const r = await pickNextManagerInternal(leadBrand, c);
+    await c.query('COMMIT');
+    return r;
+  } catch (e) {
+    await c.query('ROLLBACK');
+    throw e;
+  } finally {
+    c.release();
+  }
+}
+
+async function pickNextManagerInternal(leadBrand: string, c: PoolClient): Promise<number | null> {
   const brand = normalizeBrand(leadBrand);
-  const all = await listActiveManagersDetailed();
+  const all = await listActiveManagersDetailedTx(c);
   if (all.length === 0) return null;
 
   const ids = (list: LtbUserDoc[]) => list.map((u) => parseInt(u.id, 10));
@@ -104,35 +151,34 @@ export async function getNextManagerTelegramId(leadBrand: string): Promise<numbe
   });
   const wildcard = all.filter((u) => !u.brands || u.brands.length === 0);
 
-  let pool: number[];
+  let poolIds: number[];
   let rrKey: string;
   if (explicit.length > 0) {
-    pool = ids(explicit);
+    poolIds = ids(explicit);
     rrKey = `b:${brand}`;
   } else if (wildcard.length > 0) {
-    pool = ids(wildcard);
+    poolIds = ids(wildcard);
     rrKey = '_wildcard';
   } else {
     return null;
   }
 
-  const sref = db().collection(C.settings).doc(SETTINGS_DOC);
-  const snap = await sref.get();
-  const map = ((snap.data()?.lastManagerIdxByBrand as Record<string, number>) || {}) as Record<string, number>;
+  const { rows } = await c.query<{ last_manager_idx_by_brand: Record<string, number> }>(
+    `SELECT last_manager_idx_by_brand FROM ltb_settings WHERE id = $1 FOR UPDATE`,
+    [SETTINGS_DOC],
+  );
+  const map = { ...(rows[0]?.last_manager_idx_by_brand || {}) } as Record<string, number>;
   let idx = map[rrKey] ?? 0;
-  const pick = pool[idx % pool.length]!;
-  idx = (idx + 1) % Math.max(1, pool.length);
-  await sref.set(
-    {
-      lastManagerIdxByBrand: { ...map, [rrKey]: idx },
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
+  const pick = poolIds[idx % poolIds.length]!;
+  idx = (idx + 1) % Math.max(1, poolIds.length);
+  map[rrKey] = idx;
+  await c.query(
+    `UPDATE ltb_settings SET last_manager_idx_by_brand = $2::jsonb, updated_at = now() WHERE id = $1`,
+    [SETTINGS_DOC, JSON.stringify(map)],
   );
   return pick;
 }
 
-/** Те же пулы, что у автоназначения: по бренду → универсальные → все менеджеры. */
 export async function listManagersForBrandPick(leadBrand: string): Promise<LtbUserDoc[]> {
   const brand = normalizeBrand(leadBrand);
   const all = await listActiveManagersDetailed();
@@ -143,8 +189,8 @@ export async function listManagersForBrandPick(leadBrand: string): Promise<LtbUs
     return b.some((x) => normalizeBrand(x) === brand);
   });
   const wildcard = all.filter((u) => !u.brands || u.brands.length === 0);
-  const pool = explicit.length > 0 ? explicit : wildcard.length > 0 ? wildcard : all;
-  return pool.sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10));
+  const poolList = explicit.length > 0 ? explicit : wildcard.length > 0 ? wildcard : all;
+  return poolList.sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10));
 }
 
 export async function formatTelegramUserLabel(telegramId: number): Promise<string> {
@@ -154,7 +200,6 @@ export async function formatTelegramUserLabel(telegramId: number): Promise<strin
   return String(telegramId);
 }
 
-/** Имя из профиля без Telegram id — для сообщений «передано Дяне». */
 export async function formatTelegramShortName(telegramId: number): Promise<string> {
   const u = await getUser(telegramId);
   const n = u?.name?.trim();
@@ -163,66 +208,57 @@ export async function formatTelegramShortName(telegramId: number): Promise<strin
 }
 
 export async function updateUserDepartment(telegramId: number, departmentId: string | null): Promise<void> {
-  const ref = db().collection(C.users).doc(String(telegramId));
-  const now = Timestamp.now();
-  const prev = await ref.get();
-  if (!prev.exists) {
-    throw new Error('NO_USER_DOC');
-  }
+  const pool = getPool();
+  const chk = await pool.query(`SELECT 1 FROM ltb_users WHERE telegram_id = $1`, [telegramId]);
+  if (!chk.rowCount) throw new Error('NO_USER_DOC');
   if (!departmentId) {
-    await ref.update({ departmentId: FieldValue.delete(), updatedAt: now });
+    await pool.query(
+      `UPDATE ltb_users SET department_id = NULL, updated_at = now() WHERE telegram_id = $1`,
+      [telegramId],
+    );
     return;
   }
-  await ref.update({ departmentId: normalizeDepartmentId(departmentId), updatedAt: now });
+  await pool.query(
+    `UPDATE ltb_users SET department_id = $2, updated_at = now() WHERE telegram_id = $1`,
+    [telegramId, normalizeDepartmentId(departmentId)],
+  );
 }
 
-/** Только бренды менеджера (или снять список = «все бренды»). */
 export async function patchUserBrands(telegramId: number, brands: string[] | 'all'): Promise<void> {
-  const ref = db().collection(C.users).doc(String(telegramId));
-  const now = Timestamp.now();
-  const prev = await ref.get();
-  if (!prev.exists) throw new Error('NO_USER_DOC');
+  const pool = getPool();
+  const chk = await pool.query(`SELECT 1 FROM ltb_users WHERE telegram_id = $1`, [telegramId]);
+  if (!chk.rowCount) throw new Error('NO_USER_DOC');
   if (brands === 'all') {
-    await ref.update({ brands: FieldValue.delete(), updatedAt: now });
+    await pool.query(`UPDATE ltb_users SET brands = NULL, updated_at = now() WHERE telegram_id = $1`, [
+      telegramId,
+    ]);
     return;
   }
-  await ref.update({
-    brands: brands.map((b) => normalizeBrand(b)),
-    updatedAt: now,
-  });
+  await pool.query(
+    `UPDATE ltb_users SET brands = $2::text[], updated_at = now() WHERE telegram_id = $1`,
+    [telegramId, brands.map((b) => normalizeBrand(b))],
+  );
 }
 
-/** Менеджеры отдела (по полю departmentId). */
 export async function listManagerTgIdsInDepartment(departmentId: string): Promise<number[]> {
   const norm = normalizeDepartmentId(departmentId);
   if (!norm) return [];
-  const q = await db()
-    .collection(C.users)
-    .where('role', '==', 'manager')
-    .where('active', '==', true)
-    .get();
-  const ids: number[] = [];
-  for (const d of q.docs) {
-    const data = d.data() as LtbUserDoc;
-    if (normalizeDepartmentId(String(data.departmentId || '')) !== norm) continue;
-    const n = parseInt(d.id, 10);
-    if (Number.isFinite(n)) ids.push(n);
-  }
-  return ids.sort((a, b) => a - b);
+  const pool = getPool();
+  const { rows } = await pool.query<{ telegram_id: string }>(
+    `SELECT telegram_id FROM ltb_users
+     WHERE role = 'manager' AND active = true AND department_id = $1`,
+    [norm],
+  );
+  return rows.map((r) => parseInt(r.telegram_id, 10)).sort((a, b) => a - b);
 }
 
-/** Рассылка служебных сообщений: активные manager, rop, atz (не покупатели). */
 export async function listStaffBroadcastRecipientIds(): Promise<number[]> {
-  const roles: UserRole[] = ['manager', 'rop', 'atz'];
-  const out = new Set<number>();
-  for (const role of roles) {
-    const q = await db().collection(C.users).where('role', '==', role).where('active', '==', true).get();
-    for (const d of q.docs) {
-      const n = parseInt(d.id, 10);
-      if (Number.isFinite(n)) out.add(n);
-    }
-  }
-  return Array.from(out).sort((a, b) => a - b);
+  const pool = getPool();
+  const { rows } = await pool.query<{ telegram_id: string }>(
+    `SELECT telegram_id FROM ltb_users
+     WHERE active = true AND role IN ('manager', 'rop', 'atz') ORDER BY telegram_id`,
+  );
+  return rows.map((r) => parseInt(r.telegram_id, 10));
 }
 
 export function isAdmin(telegramId: number): boolean {

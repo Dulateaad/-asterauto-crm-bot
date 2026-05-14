@@ -1,11 +1,7 @@
-import { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { C } from '../collections';
-import { getDb } from '../firebase';
+import { getPool } from '../db';
 import type { LeadStatus, TransferReasonId, TransferTargetId } from '../types';
 import { getNextManagerTelegramId } from './ltbUsers';
 import { normalizeBrand } from '../brands';
-
-const db = () => getDb();
 
 export type CustomerVisitRating = 'good' | 'ok' | 'bad';
 export type CustomerManagerRating = 'yes' | 'partial' | 'no';
@@ -20,31 +16,91 @@ export interface LeadDoc {
   createdBy: number;
   assignedTo: number;
   comment: string;
-  createdAt: Timestamp;
-  /** Если нет (старые лиды) — для SLA используется createdAt */
-  lastAssignedAt?: Timestamp;
-  updatedAt: Timestamp;
-  firstContactAt: Timestamp | null;
-  meetingAt: Timestamp | null;
+  createdAt: Date;
+  lastAssignedAt?: Date;
+  updatedAt: Date;
+  firstContactAt: Date | null;
+  meetingAt: Date | null;
   lostReason: string | null;
   sla15Sent: boolean;
   sla30Sent: boolean;
   transferredOutCount: number;
-  /** Заявка из Telegram от покупателя — для опроса и рассылок */
   buyerTelegramId?: number;
-  /** Опрос «как прошло» ещё не отправлен */
   buyerSurveyVisitPending?: boolean;
-  /** Первый вопрос опроса уже отправлен покупателю */
   buyerSurveyVisitSent?: boolean;
-  /** Опрос завершён (все шаги или отказ) */
   buyerSurveyComplete?: boolean;
   buyerSurvey?: {
     visit?: CustomerVisitRating;
     manager?: CustomerManagerRating;
     wantOtherBrands?: boolean;
     otherBrands?: string[];
-    updatedAt?: Timestamp;
+    updatedAt?: string;
   };
+}
+
+type LeadRow = {
+  id: string;
+  fio: string;
+  phone: string;
+  brand: string;
+  payment: string;
+  budget: string;
+  status: string;
+  created_by: string;
+  assigned_to: string;
+  comment: string;
+  created_at: Date;
+  updated_at: Date;
+  last_assigned_at: Date;
+  first_contact_at: Date | null;
+  meeting_at: Date | null;
+  lost_reason: string | null;
+  sla15_sent: boolean;
+  sla30_sent: boolean;
+  transferred_out_count: number | string;
+  buyer_telegram_id: string | null;
+  buyer_survey_visit_pending: boolean;
+  buyer_survey_visit_sent: boolean;
+  buyer_survey_complete: boolean;
+  buyer_survey: Record<string, unknown>;
+};
+
+function rowToLead(r: LeadRow): LeadDoc & { id: string } {
+  const buyerSurveyRaw = r.buyer_survey && typeof r.buyer_survey === 'object' ? r.buyer_survey : {};
+  const buyerSurvey =
+    Object.keys(buyerSurveyRaw).length > 0 ? (buyerSurveyRaw as LeadDoc['buyerSurvey']) : undefined;
+  const base: LeadDoc & { id: string } = {
+    id: r.id,
+    fio: r.fio,
+    phone: r.phone,
+    brand: r.brand,
+    payment: r.payment as LeadDoc['payment'],
+    budget: r.budget,
+    status: r.status as LeadStatus,
+    createdBy: Number(r.created_by),
+    assignedTo: Number(r.assigned_to),
+    comment: r.comment,
+    createdAt: r.created_at,
+    lastAssignedAt: r.last_assigned_at,
+    updatedAt: r.updated_at,
+    firstContactAt: r.first_contact_at,
+    meetingAt: r.meeting_at,
+    lostReason: r.lost_reason,
+    sla15Sent: r.sla15_sent,
+    sla30Sent: r.sla30_sent,
+    transferredOutCount: Number(r.transferred_out_count) || 0,
+  };
+  if (r.buyer_telegram_id != null) {
+    const bt = Number(r.buyer_telegram_id);
+    if (Number.isFinite(bt)) {
+      base.buyerTelegramId = bt;
+      base.buyerSurveyVisitPending = r.buyer_survey_visit_pending;
+      base.buyerSurveyVisitSent = r.buyer_survey_visit_sent;
+      base.buyerSurveyComplete = r.buyer_survey_complete;
+      if (buyerSurvey) base.buyerSurvey = buyerSurvey;
+    }
+  }
+  return base;
 }
 
 export async function createLead(
@@ -68,109 +124,119 @@ export async function createLead(
     | 'buyerSurveyComplete'
     | 'buyerSurvey'
   > & { comment?: string; buyerTelegramId?: number },
-  assignTo: number
+  assignTo: number,
 ): Promise<string> {
-  const now = Timestamp.now();
+  const pool = getPool();
   const buyerTg = data.buyerTelegramId;
-  const ref = await db().collection(C.leads).add({
-    ...data,
-    status: 'new' as const,
-    assignedTo: assignTo,
-    comment: data.comment || '',
-    createdAt: now,
-    lastAssignedAt: now,
-    updatedAt: now,
-    firstContactAt: null,
-    meetingAt: null,
-    lostReason: null,
-    sla15Sent: false,
-    sla30Sent: false,
-    transferredOutCount: 0,
-    ...(buyerTg != null && Number.isFinite(buyerTg)
-      ? {
-          buyerTelegramId: buyerTg,
-          buyerSurveyVisitPending: true,
-          buyerSurveyVisitSent: false,
-          buyerSurveyComplete: false,
-          buyerSurvey: {},
-        }
-      : {}),
-  } satisfies LeadDoc);
-  return ref.id;
+  const hasBuyer = buyerTg != null && Number.isFinite(buyerTg);
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO ltb_leads (
+       fio, phone, brand, payment, budget, status, created_by, assigned_to, comment,
+       first_contact_at, meeting_at, lost_reason,
+       buyer_telegram_id, buyer_survey_visit_pending, buyer_survey_visit_sent, buyer_survey_complete, buyer_survey
+     ) VALUES (
+       $1, $2, $3, $4, $5, 'new', $6, $7, $8,
+       NULL, NULL, NULL,
+       $9, $10, $11, $12, $13::jsonb
+     ) RETURNING id`,
+    [
+      data.fio,
+      data.phone,
+      data.brand,
+      data.payment,
+      data.budget || '',
+      data.createdBy,
+      assignTo,
+      data.comment || '',
+      hasBuyer ? buyerTg : null,
+      hasBuyer,
+      false,
+      false,
+      '{}',
+    ],
+  );
+  return rows[0]!.id;
 }
 
-export async function countLeadsByBrandSince(since: Timestamp): Promise<Map<string, number>> {
-  const q = await db().collection(C.leads).where('createdAt', '>=', since).limit(500).get();
+export async function countLeadsByBrandSince(since: Date): Promise<Map<string, number>> {
+  const pool = getPool();
+  const { rows } = await pool.query<{ brand: string; c: string }>(
+    `SELECT brand, COUNT(*)::text AS c FROM ltb_leads WHERE created_at >= $1 GROUP BY brand`,
+    [since],
+  );
   const m = new Map<string, number>();
-  for (const d of q.docs) {
-    const b = normalizeBrand(String((d.data() as LeadDoc).brand || '—'));
-    m.set(b, (m.get(b) || 0) + 1);
+  for (const r of rows) {
+    m.set(normalizeBrand(String(r.brand || '—')), parseInt(r.c, 10));
   }
   return m;
 }
 
 export async function getLead(id: string) {
-  const s = await db().collection(C.leads).doc(id).get();
-  if (!s.exists) return null;
-  return { id: s.id, ...(s.data() as LeadDoc) };
+  const pool = getPool();
+  const { rows } = await pool.query<LeadRow>(`SELECT * FROM ltb_leads WHERE id = $1`, [id]);
+  const r = rows[0];
+  if (!r) return null;
+  return rowToLead(r);
 }
 
 export async function listMyLeads(managerTg: number) {
-  const q = await db()
-    .collection(C.leads)
-    .where('assignedTo', '==', managerTg)
-    .limit(50)
-    .get();
-  const rows = q.docs.map((d) => ({ id: d.id, ...(d.data() as LeadDoc) }));
-  return rows.sort((a, b) => b.createdAt.toMillis() - a.createdAt.toMillis());
+  const pool = getPool();
+  const { rows } = await pool.query<LeadRow>(
+    `SELECT * FROM ltb_leads WHERE assigned_to = $1 ORDER BY created_at DESC LIMIT 50`,
+    [managerTg],
+  );
+  return rows.map(rowToLead);
 }
 
-/** Для SLA: от последнего назначения (после передачи — новый отсчёт 15/30 мин). */
 export function slaClockMillis(L: LeadDoc & { id?: string }): number {
-  const la = (L as LeadDoc).lastAssignedAt;
-  return (la ?? L.createdAt).toMillis();
+  const la = L.lastAssignedAt;
+  const t = la ?? L.createdAt;
+  return t instanceof Date ? t.getTime() : new Date(t as string).getTime();
 }
 
 export async function listLeadsNeedingSla() {
-  const q = await db().collection(C.leads).where('status', '==', 'new').limit(200).get();
-  return q.docs
-    .map((d) => ({ id: d.id, ...(d.data() as LeadDoc) }))
-    .filter((L) => L.firstContactAt == null);
+  const pool = getPool();
+  const { rows } = await pool.query<LeadRow>(
+    `SELECT * FROM ltb_leads WHERE status = 'new' AND first_contact_at IS NULL LIMIT 200`,
+  );
+  return rows.map(rowToLead);
 }
 
 export async function markFirstContact(leadId: string) {
-  await db()
-    .collection(C.leads)
-    .doc(leadId)
-    .update({
-      firstContactAt: FieldValue.serverTimestamp(),
-      status: 'contacted',
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+  const pool = getPool();
+  await pool.query(
+    `UPDATE ltb_leads SET first_contact_at = now(), status = 'contacted', updated_at = now() WHERE id = $1`,
+    [leadId],
+  );
 }
 
 export async function setSlaFlags(leadId: string, sla15: boolean, sla30: boolean) {
-  const u: Record<string, unknown> = { updatedAt: FieldValue.serverTimestamp() };
-  if (sla15) u.sla15Sent = true;
-  if (sla30) u.sla30Sent = true;
-  await db().collection(C.leads).doc(leadId).update(u);
+  const pool = getPool();
+  if (sla15 && sla30) {
+    await pool.query(
+      `UPDATE ltb_leads SET sla15_sent = true, sla30_sent = true, updated_at = now() WHERE id = $1`,
+      [leadId],
+    );
+  } else if (sla15) {
+    await pool.query(`UPDATE ltb_leads SET sla15_sent = true, updated_at = now() WHERE id = $1`, [leadId]);
+  } else if (sla30) {
+    await pool.query(`UPDATE ltb_leads SET sla30_sent = true, updated_at = now() WHERE id = $1`, [leadId]);
+  } else {
+    await pool.query(`UPDATE ltb_leads SET updated_at = now() WHERE id = $1`, [leadId]);
+  }
 }
 
 export async function updateLeadStatus(leadId: string, status: LeadStatus) {
-  await db()
-    .collection(C.leads)
-    .doc(leadId)
-    .update({ status, updatedAt: FieldValue.serverTimestamp() });
+  const pool = getPool();
+  await pool.query(`UPDATE ltb_leads SET status = $2, updated_at = now() WHERE id = $1`, [leadId, status]);
 }
 
 export async function addNote(leadId: string, line: string) {
-  const ref = db().collection(C.leads).doc(leadId);
-  const s = await ref.get();
-  const cur = (s.data()?.comment as string) || '';
-  await ref.update({
-    comment: cur ? `${cur}\n${line}` : line,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
+  const pool = getPool();
+  await pool.query(
+    `UPDATE ltb_leads SET comment = CASE WHEN comment = '' THEN $2 ELSE comment || E'\\n' || $2 END, updated_at = now() WHERE id = $1`,
+    [leadId, line],
+  );
 }
 
 export async function recordTransfer(
@@ -178,57 +244,67 @@ export async function recordTransfer(
   fromTg: number,
   reason: TransferReasonId,
   target: TransferTargetId,
-  comment: string
+  comment: string,
 ) {
-  const leadRef = db().collection(C.leads).doc(leadId);
-  const leadSnap = await leadRef.get();
-  if (!leadSnap.exists) throw new Error('NO_LEAD');
-  const brand = String((leadSnap.data() as LeadDoc)?.brand || '');
-  const newManager = await getNextManagerTelegramId(brand);
-  if (!newManager) {
-    throw new Error('NO_MANAGERS');
-  }
-  const prev = (leadSnap.data()?.comment as string) || '';
-  const transferNote = `Передача: ${reason} → ${target}. ${comment}`;
-  const newComment = prev ? `${prev}\n\n${transferNote}` : transferNote;
+  const pool = getPool();
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const { rows: leadRows } = await c.query<LeadRow>(`SELECT * FROM ltb_leads WHERE id = $1 FOR UPDATE`, [leadId]);
+    const leadSnap = leadRows[0];
+    if (!leadSnap) throw new Error('NO_LEAD');
+    const brand = String(leadSnap.brand || '');
+    const newManager = await getNextManagerTelegramId(brand, c);
+    if (!newManager) {
+      throw new Error('NO_MANAGERS');
+    }
+    const prev = leadSnap.comment || '';
+    const transferNote = `Передача: ${reason} → ${target}. ${comment}`;
+    const newComment = prev ? `${prev}\n\n${transferNote}` : transferNote;
 
-  const batch = db().batch();
-  batch.update(leadRef, {
-    comment: newComment,
-    assignedTo: newManager,
-    status: 'new',
-    transferredOutCount: FieldValue.increment(1),
-    lastAssignedAt: FieldValue.serverTimestamp(),
-    sla15Sent: false,
-    sla30Sent: false,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
-  const trRef = db().collection(C.transfers).doc();
-  batch.set(trRef, {
-    leadId,
-    fromTelegramId: fromTg,
-    reason,
-    target,
-    comment,
-    toTelegramId: newManager,
-    createdAt: FieldValue.serverTimestamp(),
-  });
-  await batch.commit();
-  return { newManager };
+    await c.query(
+      `UPDATE ltb_leads SET
+         comment = $2,
+         assigned_to = $3,
+         status = 'new',
+         transferred_out_count = transferred_out_count + 1,
+         last_assigned_at = now(),
+         sla15_sent = false,
+         sla30_sent = false,
+         updated_at = now()
+       WHERE id = $1`,
+      [leadId, newComment, newManager],
+    );
+    await c.query(
+      `INSERT INTO ltb_transfers (lead_id, from_telegram_id, to_telegram_id, reason, target, comment)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [leadId, fromTg, newManager, reason, target, comment],
+    );
+    await c.query('COMMIT');
+    return { newManager };
+  } catch (e) {
+    await c.query('ROLLBACK');
+    throw e;
+  } finally {
+    c.release();
+  }
 }
 
-export async function countLeadsSince(since: Timestamp) {
-  const q = await db().collection(C.leads).where('createdAt', '>=', since).get();
-  return q.size;
+export async function countLeadsSince(since: Date) {
+  const pool = getPool();
+  const { rows } = await pool.query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM ltb_leads WHERE created_at >= $1`,
+    [since],
+  );
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
 export async function countToday() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
-  return countLeadsSince(Timestamp.fromDate(d));
+  return countLeadsSince(d);
 }
 
-/** Границы локального календарного дня (как countToday): daysAgo 0 = сегодня 00:00, 1 = вчера 00:00 */
 function localDayStartMidnight(daysAgoFromToday: number): Date {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
@@ -236,94 +312,91 @@ function localDayStartMidnight(daysAgoFromToday: number): Date {
   return d;
 }
 
-export async function countLeadsCreatedBetween(start: Timestamp, endExclusive: Timestamp): Promise<number> {
-  const q = await db()
-    .collection(C.leads)
-    .where('createdAt', '>=', start)
-    .where('createdAt', '<', endExclusive)
-    .get();
-  return q.size;
+export async function countLeadsCreatedBetween(start: Date, endExclusive: Date): Promise<number> {
+  const pool = getPool();
+  const { rows } = await pool.query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM ltb_leads WHERE created_at >= $1 AND created_at < $2`,
+    [start, endExclusive],
+  );
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
-/** Лиды, созданные за полные локальные сутки. daysAgo: 1 = вчера, 2 = позавчера */
 export async function countLeadsOnLocalCalendarDay(daysAgo: number): Promise<number> {
   const start = localDayStartMidnight(daysAgo);
   const endExclusive = localDayStartMidnight(daysAgo - 1);
-  return countLeadsCreatedBetween(Timestamp.fromDate(start), Timestamp.fromDate(endExclusive));
+  return countLeadsCreatedBetween(start, endExclusive);
 }
 
-/** Как countLeadsOnLocalCalendarDay, но только лиды, назначенные на менеджеров из пула (лимит скана). */
 export async function countLeadsOnLocalDayForAssignedPool(
   assignedTgIds: Set<number>,
   daysAgo: number,
-  scanLimit = 800,
+  _scanLimit = 800,
 ): Promise<number> {
   if (assignedTgIds.size === 0) return 0;
   const start = localDayStartMidnight(daysAgo);
   const endExclusive = localDayStartMidnight(daysAgo - 1);
-  const q = await db()
-    .collection(C.leads)
-    .where('createdAt', '>=', Timestamp.fromDate(start))
-    .where('createdAt', '<', Timestamp.fromDate(endExclusive))
-    .limit(scanLimit)
-    .get();
-  let n = 0;
-  for (const d of q.docs) {
-    if (assignedTgIds.has((d.data() as LeadDoc).assignedTo)) n++;
-  }
-  return n;
+  const pool = getPool();
+  const ids = Array.from(assignedTgIds);
+  const { rows } = await pool.query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM ltb_leads
+     WHERE created_at >= $1 AND created_at < $2 AND assigned_to = ANY($3::bigint[])`,
+    [start, endExclusive, ids],
+  );
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
-/** Лиды с createdAt >= since, у которых assignedTo входит в отдел (скан ограничен). */
 export async function countLeadsSinceForAssignedPool(
   assignedTgIds: Set<number>,
-  since: Timestamp,
-  scanLimit = 600,
+  since: Date,
+  _scanLimit = 600,
 ): Promise<number> {
   if (assignedTgIds.size === 0) return 0;
-  const q = await db().collection(C.leads).where('createdAt', '>=', since).limit(scanLimit).get();
-  let n = 0;
-  for (const d of q.docs) {
-    const a = (d.data() as LeadDoc).assignedTo;
-    if (assignedTgIds.has(a)) n++;
-  }
-  return n;
+  const pool = getPool();
+  const ids = Array.from(assignedTgIds);
+  const { rows } = await pool.query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM ltb_leads WHERE created_at >= $1 AND assigned_to = ANY($2::bigint[])`,
+    [since, ids],
+  );
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
 export async function countAllLeads(): Promise<number> {
-  const snap = await db().collection(C.leads).count().get();
-  return snap.data().count;
+  const pool = getPool();
+  const { rows } = await pool.query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM ltb_leads`);
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
-/** Сколько лидов сейчас назначено на менеджера (все статусы). */
 export async function countLeadsAssignedTo(managerTg: number): Promise<number> {
-  const snap = await db().collection(C.leads).where('assignedTo', '==', managerTg).count().get();
-  return snap.data().count;
+  const pool = getPool();
+  const { rows } = await pool.query<{ c: string }>(
+    `SELECT COUNT(*)::text AS c FROM ltb_leads WHERE assigned_to = $1`,
+    [managerTg],
+  );
+  return parseInt(rows[0]?.c || '0', 10);
 }
 
-/** Лиды покупателей из Telegram, которым пора отправить первый вопрос опроса. */
 export async function listLeadsNeedingBuyerSurveyVisit(
   minAgeMs: number,
 ): Promise<(LeadDoc & { id: string })[]> {
-  const q = await db().collection(C.leads).where('buyerSurveyVisitPending', '==', true).limit(200).get();
-  const now = Date.now();
-  return q.docs
-    .map((d) => ({ id: d.id, ...(d.data() as LeadDoc) }))
-    .filter((L) => {
-      if (L.buyerSurveyVisitSent) return false;
-      if (L.buyerTelegramId == null || !Number.isFinite(L.buyerTelegramId)) return false;
-      return now - L.createdAt.toMillis() >= minAgeMs;
-    });
+  const pool = getPool();
+  const { rows } = await pool.query<LeadRow>(
+    `SELECT * FROM ltb_leads
+     WHERE buyer_survey_visit_pending = true
+       AND buyer_survey_visit_sent = false
+       AND buyer_telegram_id IS NOT NULL
+       AND (EXTRACT(EPOCH FROM (now() - created_at)) * 1000) >= $1
+     LIMIT 200`,
+    [minAgeMs],
+  );
+  return rows.map(rowToLead);
 }
 
 export async function markBuyerSurveyVisitSent(leadId: string): Promise<void> {
-  await db()
-    .collection(C.leads)
-    .doc(leadId)
-    .update({
-      buyerSurveyVisitSent: true,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+  const pool = getPool();
+  await pool.query(
+    `UPDATE ltb_leads SET buyer_survey_visit_sent = true, updated_at = now() WHERE id = $1`,
+    [leadId],
+  );
 }
 
 export async function patchBuyerSurvey(
@@ -331,18 +404,22 @@ export async function patchBuyerSurvey(
   patch: Partial<NonNullable<LeadDoc['buyerSurvey']>>,
   options?: { complete?: boolean },
 ): Promise<void> {
-  const ref = db().collection(C.leads).doc(leadId);
-  const snap = await ref.get();
-  if (!snap.exists) return;
-  const cur = (snap.data()?.buyerSurvey as LeadDoc['buyerSurvey']) || {};
-  const next = { ...cur, ...patch, updatedAt: Timestamp.now() };
-  const u: Record<string, unknown> = {
-    buyerSurvey: next,
-    updatedAt: FieldValue.serverTimestamp(),
+  const pool = getPool();
+  const cur = await getLead(leadId);
+  if (!cur) return;
+  const prev = cur.buyerSurvey || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updatedAt: new Date().toISOString(),
   };
-  if (options?.complete) {
-    u.buyerSurveyVisitPending = false;
-    u.buyerSurveyComplete = true;
-  }
-  await ref.update(u);
+  await pool.query(
+    `UPDATE ltb_leads SET
+       buyer_survey = $2::jsonb,
+       updated_at = now(),
+       buyer_survey_visit_pending = CASE WHEN $3 THEN false ELSE buyer_survey_visit_pending END,
+       buyer_survey_complete = CASE WHEN $3 THEN true ELSE buyer_survey_complete END
+     WHERE id = $1`,
+    [leadId, JSON.stringify(next), options?.complete === true],
+  );
 }

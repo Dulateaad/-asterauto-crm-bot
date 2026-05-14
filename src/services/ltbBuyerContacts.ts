@@ -1,19 +1,14 @@
-import { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { C } from '../collections';
-import { getDb } from '../firebase';
+import { getPool } from '../db';
 import { normalizeBrand } from '../brands';
-
-const db = () => getDb();
 
 export type BuyerContactDoc = {
   telegramId: number;
   fio: string;
   phone: string;
-  /** Интересующие бренды (для рассылок) */
   brands: string[];
   marketingOptIn: boolean;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
+  createdAt: Date;
+  updatedAt: Date;
   lastLeadId?: string;
 };
 
@@ -39,47 +34,61 @@ export async function upsertBuyerContact(input: {
   marketingOptIn: boolean;
   lastLeadId?: string;
 }): Promise<void> {
-  const id = String(input.telegramId);
-  const ref = db().collection(C.buyerContacts).doc(id);
-  const now = Timestamp.now();
-  const snap = await ref.get();
-  const prev = snap.exists ? (snap.data() as BuyerContactDoc) : null;
-  const mergedBrands = uniqBrands([...(prev?.brands || []), ...input.brands]);
-  const payload: Record<string, unknown> = {
-    telegramId: input.telegramId,
-    fio: input.fio.trim(),
-    phone: input.phone.trim(),
-    brands: mergedBrands,
-    marketingOptIn: input.marketingOptIn,
-    updatedAt: now,
-    ...(input.lastLeadId ? { lastLeadId: input.lastLeadId } : {}),
-  };
-  if (!prev) {
-    payload.createdAt = now;
-  }
-  await ref.set(payload, { merge: true });
+  const pool = getPool();
+  const { rows: prevRows } = await pool.query<{ brands: string[] }>(
+    `SELECT brands FROM ltb_buyer_contacts WHERE telegram_id = $1`,
+    [input.telegramId],
+  );
+  const prevBrands = prevRows[0]?.brands || [];
+  const mergedBrands = uniqBrands([...prevBrands, ...input.brands]);
+
+  await pool.query(
+    `INSERT INTO ltb_buyer_contacts (telegram_id, fio, phone, brands, marketing_opt_in, last_lead_id, updated_at)
+     VALUES ($1, $2, $3, $4::text[], $5, $6, now())
+     ON CONFLICT (telegram_id) DO UPDATE SET
+       fio = EXCLUDED.fio,
+       phone = EXCLUDED.phone,
+       brands = EXCLUDED.brands,
+       marketing_opt_in = EXCLUDED.marketing_opt_in,
+       last_lead_id = COALESCE(EXCLUDED.last_lead_id, ltb_buyer_contacts.last_lead_id),
+       updated_at = now()`,
+    [
+      input.telegramId,
+      input.fio.trim(),
+      input.phone.trim(),
+      mergedBrands,
+      input.marketingOptIn,
+      input.lastLeadId ?? null,
+    ],
+  );
 }
 
 export async function appendBrandsToBuyer(telegramId: number, extra: string[]): Promise<void> {
-  const id = String(telegramId);
-  const ref = db().collection(C.buyerContacts).doc(id);
-  const snap = await ref.get();
-  if (!snap.exists) return;
-  const prev = snap.data() as BuyerContactDoc;
+  const pool = getPool();
+  const { rows } = await pool.query<{ brands: string[] }>(
+    `SELECT brands FROM ltb_buyer_contacts WHERE telegram_id = $1`,
+    [telegramId],
+  );
+  const prev = rows[0];
+  if (!prev) return;
   const brands = uniqBrands([...(prev.brands || []), ...extra]);
-  await ref.update({ brands, updatedAt: FieldValue.serverTimestamp() });
+  await pool.query(`UPDATE ltb_buyer_contacts SET brands = $2::text[], updated_at = now() WHERE telegram_id = $1`, [
+    telegramId,
+    brands,
+  ]);
 }
 
-/** Подписчики с opt-in и брендом в списке (для /notify_brand). */
 export async function listMarketingRecipientsForBrand(brand: string): Promise<number[]> {
-  const b = normalizeBrand(brand);
-  const q = await db().collection(C.buyerContacts).where('marketingOptIn', '==', true).limit(500).get();
+  const b = normalizeBrand(brand).toLowerCase();
+  const pool = getPool();
+  const { rows } = await pool.query<{ telegram_id: string; brands: string[] }>(
+    `SELECT telegram_id, brands FROM ltb_buyer_contacts WHERE marketing_opt_in = true LIMIT 500`,
+  );
   const out: number[] = [];
-  for (const d of q.docs) {
-    const row = d.data() as BuyerContactDoc;
-    const brands = row.brands || [];
-    if (brands.some((x) => normalizeBrand(x).toLowerCase() === b.toLowerCase())) {
-      out.push(row.telegramId);
+  for (const r of rows) {
+    const brands = r.brands || [];
+    if (brands.some((x) => normalizeBrand(x).toLowerCase() === b)) {
+      out.push(parseInt(r.telegram_id, 10));
     }
   }
   return out;
