@@ -18,5 +18,15 @@ export const config = {
   slaRopMinutes: Math.max(1, parseInt(process.env.SLA_ROP_MINUTES || '30', 10)),
   /** Опрос покупателя после самостоятельной заявки из Telegram (минуты) */
   customerSurveyMinutes: Math.max(1, parseInt(process.env.CUSTOMER_SURVEY_MINUTES || '15', 10)),
-  pollerIntervalMs: 60_000,
+  /**
+   * Интервал фоновых задач (SLA + опрос покупателя). Чем реже — тем меньше чтений Firestore.
+   * При RESOURCE_EXHAUSTED на Render поставьте, например, BOT_POLLER_INTERVAL_MS=300000 (5 мин).
+   */
+  pollerIntervalMs: Math.max(
+    30_000,
+    parseInt(process.env.BOT_POLLER_INTERVAL_MS || '120000', 10) || 120_000,
+  ),
+  /** Временно отключить фоновые опросы Firestore (true/1) — только ручные действия в боте */
+  disableBackgroundPoll:
+    process.env.BOT_DISABLE_BACKGROUND_POLL === 'true' || process.env.BOT_DISABLE_BACKGROUND_POLL === '1',
 };

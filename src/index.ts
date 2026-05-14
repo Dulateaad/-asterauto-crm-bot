@@ -387,9 +387,12 @@ async function sendMain(ctx: Context, uid: number) {
     console.error('sendMain / Firestore:', e);
     const grpc = e as { code?: number; details?: string };
     const isDenied = grpc.code === 7 || String(grpc.details || '').includes('PERMISSION_DENIED');
+    const isQuota = grpc.code === 8 || String(grpc.details || '').includes('Quota exceeded');
     const hint = isDenied
       ? 'Доступ к Firestore запрещён (IAM). В Google Cloud Console → IAM для проекта ключа выдайте этому сервисному аккаунту роль «Cloud Datastore User» или «Editor». Убедитесь, что в Firebase для этого проекта включён Firestore, а JSON ключ скачан из того же проекта.'
-      : 'На Render проверьте FIREBASE_SERVICE_ACCOUNT_JSON (полный JSON) и что Firestore включён в Firebase Console.';
+      : isQuota
+        ? 'Превышена квота Firestore (RESOURCE_EXHAUSTED). Оставьте один экземпляр бота на Render; в Environment задайте BOT_DISABLE_BACKGROUND_POLL=1 и BOT_POLLER_INTERVAL_MS=300000, перезапустите сервис. В Google Cloud → Quotas проверьте лимиты Firestore.'
+        : 'На Render проверьте FIREBASE_SERVICE_ACCOUNT_JSON (полный JSON) и что Firestore включён в Firebase Console.';
     await ctx.reply('Не удалось связаться с базой.\n' + hint);
   }
 }
@@ -2016,10 +2019,17 @@ async function main() {
     }
   });
 
-  setInterval(() => {
-    runSlaBot(bot).catch(() => null);
-    runCustomerSurveyBot(bot).catch(() => null);
-  }, config.pollerIntervalMs);
+  if (config.disableBackgroundPoll) {
+    // eslint-disable-next-line no-console
+    console.warn('[bot] BOT_DISABLE_BACKGROUND_POLL: фоновые опросы Firestore отключены (SLA и опрос покупателя).');
+  } else {
+    setInterval(() => {
+      runSlaBot(bot).catch(() => null);
+      runCustomerSurveyBot(bot).catch(() => null);
+    }, config.pollerIntervalMs);
+    // eslint-disable-next-line no-console
+    console.log('[bot] фоновый poller каждые', config.pollerIntervalMs, 'мс');
+  }
 
   const me = await bot.telegram.getMe();
   // eslint-disable-next-line no-console
