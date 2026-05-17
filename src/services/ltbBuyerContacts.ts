@@ -78,6 +78,16 @@ export async function appendBrandsToBuyer(telegramId: number, extra: string[]): 
   ]);
 }
 
+/** Все telegram_id покупателей из ltb_buyer_contacts (для рассылки админом). */
+export async function listAllBuyerTelegramIds(limit = 3000): Promise<number[]> {
+  const pool = getPool();
+  const { rows } = await pool.query<{ telegram_id: string }>(
+    `SELECT telegram_id FROM ltb_buyer_contacts ORDER BY updated_at DESC NULLS LAST, telegram_id LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => parseInt(r.telegram_id, 10)).filter((n) => Number.isFinite(n));
+}
+
 export async function listMarketingRecipientsForBrand(brand: string): Promise<number[]> {
   const b = normalizeBrand(brand).toLowerCase();
   const pool = getPool();

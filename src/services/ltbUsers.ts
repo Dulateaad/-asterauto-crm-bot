@@ -268,6 +268,13 @@ export async function isBotAdmin(telegramId: number): Promise<boolean> {
   return u?.role === 'admin';
 }
 
+/** Журнал передач по всей компании: админ или РОП. */
+export async function canViewAllTransfers(telegramId: number): Promise<boolean> {
+  if (await isBotAdmin(telegramId)) return true;
+  const u = await getUser(telegramId);
+  return u?.role === 'rop';
+}
+
 export function ropTelegramIdsFromEnv(): number[] {
   return config.ropIds;
 }

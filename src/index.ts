@@ -5,6 +5,7 @@ import { Telegraf, type Context } from 'telegraf';
 import {
   getUser,
   isBotAdmin,
+  canViewAllTransfers,
   ropTelegramIdsFromEnv,
   setUser,
   listManagersForBrandPick,
@@ -39,7 +40,7 @@ import {
   slaClockMillis,
   type LeadDoc,
 } from './services/ltbLeads';
-import { appendBrandsToBuyer, listMarketingRecipientsForBrand, upsertBuyerContact } from './services/ltbBuyerContacts';
+import { appendBrandsToBuyer, listMarketingRecipientsForBrand, listAllBuyerTelegramIds, upsertBuyerContact } from './services/ltbBuyerContacts';
 import {
   listRecentTransfers,
   listTransfersSince,
@@ -87,8 +88,8 @@ function mainKb(role: string) {
     return Markup.keyboard([
       ['📊 Статистика', '📋 Все лиды'],
       ['⏰ Просроченные', '👥 По менеджерам'],
-      ['🔄 Передачи', '⚙️ Настройки'],
-      ['🏠 Главное'],
+      ['📤 Все передачи', '🔄 Передачи отдела'],
+      ['⚙️ Настройки', '🏠 Главное'],
     ]).resize();
   }
   if (role === 'manager' || role === 'admin') {
@@ -395,12 +396,12 @@ async function sendMain(ctx: Context, uid: number) {
   }
 }
 
-async function sendAdminTransfersReport(ctx: Context, uid: number) {
-  if (!(await isBotAdmin(uid))) {
+async function sendCompanyTransfersReport(ctx: Context, uid: number) {
+  if (!(await canViewAllTransfers(uid))) {
     await ctx.reply('Нет прав.');
     return;
   }
-  const rows = await listRecentTransfers(40);
+  const rows = await listRecentTransfers(50);
   if (rows.length === 0) {
     await ctx.reply('Пока нет записей о передачах.');
     return;
@@ -937,16 +938,18 @@ async function main() {
     ctx.reply(
       'Покупатель: /start — заявка на авто, бренд и контакты; позже — короткий опрос и рассылки по согласию.\n\n' +
         'РОП:\n«📊 Статистика» — сводка по отделу + по менеджерам (нужен /setdept).\n' +
-        '«🔄 Передачи» — кто кому передал лидов в отделе (7 дн.).\n' +
+        '«📤 Все передачи» — журнал передач по всей компании (как у админа).\n' +
+        '«🔄 Передачи отдела» — только передачи с участием вашего отдела (7 дн.).\n' +
         '«👥 По менеджерам» — отдал / принял / в работе по каждому.\n' +
-        '/rop_transfers — то же, что кнопка передач.\n\n' +
+        '/rop_transfers — журнал передач по компании.\n\n' +
         'Админ:\n/addadmin <id> <ФИО> — назначить админа (роль в базе)\n' +
         '/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
-        '/transfers — кто передал лид и кому (только админ)\n' +
-        '/stats — лиды по брендам (сегодня / 7 дней) и передачи за 7 дней (только админ)\n' +
+        '/transfers — журнал передач по компании (админ и РОП)\n' +
+        '/stats — лиды по брендам и передачи за 7 дней (только админ)\n' +
         '/admin_digest — лиды сегодня / всего + кому чаще передавали (только админ)\n' +
+        '/broadcast_clients Текст — рассылка всем покупателям в базе контактов бота (только админ)\n' +
         '/broadcast Текст — сообщение всем manager, РОП и АТЗ (только админ)\n' +
         '/setdept <telegram_id> <отдел> — привязка РОП и менеджеров к отделу (slug, напр. changan)\n' +
         '/editmgr <telegram_id> — сменить бренды у существующего менеджера (кнопками)\n' +
@@ -958,7 +961,7 @@ async function main() {
   bot.command('transfers', async (ctx) => {
     const uid = ctx.from?.id;
     if (!uid) return;
-    await sendAdminTransfersReport(ctx, uid);
+    await sendCompanyTransfersReport(ctx, uid);
   });
 
   bot.command('rop_transfers', async (ctx) => {
@@ -968,7 +971,7 @@ async function main() {
     if (!u || u.role !== 'rop') {
       return ctx.reply('Команда только для РОП.');
     }
-    await sendRopDepartmentTransfers(ctx, uid);
+    await sendCompanyTransfersReport(ctx, uid);
   });
 
   bot.command('admin_digest', async (ctx) => {
@@ -1003,6 +1006,39 @@ async function main() {
   };
   bot.hears(/^\/broadcast(?:@\S+)?(?:\s+(.+))?$/is, handleBroadcast);
   bot.command('broadcast', handleBroadcast);
+
+  const handleBroadcastClients = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !(await isBotAdmin(uid))) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/broadcast_clients(?:@\S+)?\s+([\s\S]+)$/is);
+    const body = m?.[1]?.trim();
+    if (!body) {
+      return ctx.reply(
+        'Формат: /broadcast_clients Текст\n' +
+          'Рассылка в личку всем, кто есть в базе покупателей (ltb_buyer_contacts), до 3000 адресов.',
+      );
+    }
+    const ids = await listAllBuyerTelegramIds(3000);
+    if (ids.length === 0) {
+      return ctx.reply('В базе пока нет контактов покупателей (никто не оставлял заявку через бота).');
+    }
+    let ok = 0;
+    for (const tid of ids) {
+      if (tid === uid) continue;
+      try {
+        await ctx.telegram.sendMessage(tid, body);
+        ok++;
+      } catch {
+        /* заблокировали бота и т.п. */
+      }
+    }
+    return ctx.reply(`Готово: отправлено ${ok} из ${ids.length} (вы себе не дублируем).`);
+  };
+  bot.hears(/^\/broadcast_clients(?:@\S+)?(?:\s+(.+))?$/is, handleBroadcastClients);
+  bot.command('broadcast_clients', handleBroadcastClients);
 
   const handleSetdept = async (ctx: Context) => {
     const uid = ctx.from?.id;
@@ -2005,7 +2041,11 @@ async function main() {
       if ((await getUser(uid))?.role !== 'rop') return;
       return ctx.reply('Раздел в разработке.');
     }
-    if (text === '🔄 Передачи') {
+    if (text === '📤 Все передачи') {
+      if ((await getUser(uid))?.role !== 'rop') return;
+      return sendCompanyTransfersReport(ctx, uid);
+    }
+    if (text === '🔄 Передачи отдела') {
       if ((await getUser(uid))?.role !== 'rop') return;
       return sendRopDepartmentTransfers(ctx, uid);
     }
@@ -2015,7 +2055,7 @@ async function main() {
     }
     if (text === '📤 Передачи (кто кому)') {
       if (!(await isBotAdmin(uid))) return;
-      return sendAdminTransfersReport(ctx, uid);
+      return sendCompanyTransfersReport(ctx, uid);
     }
     if (text === '📊 Сводка') {
       if (!(await isBotAdmin(uid))) return;
