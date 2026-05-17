@@ -261,8 +261,11 @@ export async function listStaffBroadcastRecipientIds(): Promise<number[]> {
   return rows.map((r) => parseInt(r.telegram_id, 10));
 }
 
-export function isAdmin(telegramId: number): boolean {
-  return config.adminIds.includes(telegramId);
+/** Полные права админа: в .env (BOT_ADMIN_IDS) или роль admin в БД. */
+export async function isBotAdmin(telegramId: number): Promise<boolean> {
+  if (config.adminIds.includes(telegramId)) return true;
+  const u = await getUser(telegramId);
+  return u?.role === 'admin';
 }
 
 export function ropTelegramIdsFromEnv(): number[] {

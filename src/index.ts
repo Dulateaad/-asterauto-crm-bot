@@ -4,7 +4,7 @@ import { initDb, databaseUrlHostSummary } from './db';
 import { Telegraf, type Context } from 'telegraf';
 import {
   getUser,
-  isAdmin,
+  isBotAdmin,
   ropTelegramIdsFromEnv,
   setUser,
   listManagersForBrandPick,
@@ -355,7 +355,7 @@ async function sendMain(ctx: Context, uid: number) {
   try {
     let u = await getUser(uid);
     // Первый вход: ID в BOT_ADMIN_IDS, но ещё нет строки в ltb_users — создаём admin
-    if (!u && isAdmin(uid)) {
+    if (!u && (await isBotAdmin(uid))) {
       const label =
         [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') ||
         ctx.from?.username ||
@@ -396,7 +396,7 @@ async function sendMain(ctx: Context, uid: number) {
 }
 
 async function sendAdminTransfersReport(ctx: Context, uid: number) {
-  if (!isAdmin(uid)) {
+  if (!(await isBotAdmin(uid))) {
     await ctx.reply('Нет прав.');
     return;
   }
@@ -436,7 +436,7 @@ async function sendAdminTransfersReport(ctx: Context, uid: number) {
 }
 
 async function sendAdminStatsSummary(ctx: Context, uid: number) {
-  if (!isAdmin(uid)) {
+  if (!(await isBotAdmin(uid))) {
     await ctx.reply('Нет прав.');
     return;
   }
@@ -772,7 +772,7 @@ async function sendStaffStatsBoard(ctx: Context, viewerUid: number) {
 }
 
 async function sendAdminLeadsDigest(ctx: Context, uid: number) {
-  if (!isAdmin(uid)) {
+  if (!(await isBotAdmin(uid))) {
     await ctx.reply('Нет прав.');
     return;
   }
@@ -940,7 +940,8 @@ async function main() {
         '«🔄 Передачи» — кто кому передал лидов в отделе (7 дн.).\n' +
         '«👥 По менеджерам» — отдал / принял / в работе по каждому.\n' +
         '/rop_transfers — то же, что кнопка передач.\n\n' +
-        'Админ:\n/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
+        'Админ:\n/addadmin <id> <ФИО> — назначить админа (роль в базе)\n' +
+        '/adduser <id> <роль> <ФИО> — бренды кнопками (manager, rop, atz, admin, админ зала)\n' +
         '/adduser <id> <роль> <имя> -- Changan — бренды текстом\n' +
         '/notify_brand OMODA Текст — рассылка подписчикам бренда (только из бота)\n' +
         '/transfers — кто передал лид и кому (только админ)\n' +
@@ -978,7 +979,7 @@ async function main() {
 
   const handleBroadcast = async (ctx: Context) => {
     const uid = ctx.from?.id;
-    if (!uid || !isAdmin(uid)) {
+    if (!uid || !(await isBotAdmin(uid))) {
       return ctx.reply('Нет прав.');
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
@@ -1005,7 +1006,7 @@ async function main() {
 
   const handleSetdept = async (ctx: Context) => {
     const uid = ctx.from?.id;
-    if (!uid || !isAdmin(uid)) {
+    if (!uid || !(await isBotAdmin(uid))) {
       return ctx.reply('Нет прав.');
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
@@ -1040,7 +1041,7 @@ async function main() {
 
   const handleNotifyBrand = async (ctx: Context) => {
     const uid = ctx.from?.id;
-    if (!uid || !isAdmin(uid)) {
+    if (!uid || !(await isBotAdmin(uid))) {
       return ctx.reply('Нет прав.');
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
@@ -1072,7 +1073,7 @@ async function main() {
 
   const handleAdduser = async (ctx: Context) => {
     const uid = ctx.from?.id;
-    if (!uid || !isAdmin(uid)) {
+    if (!uid || !(await isBotAdmin(uid))) {
       return ctx.reply('Нет прав.');
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
@@ -1147,9 +1148,35 @@ async function main() {
   bot.hears(/^\/adduser(?:@\S+)?(?:$|\s+(.*))$/is, handleAdduser);
   bot.command('adduser', handleAdduser);
 
+  const handleAddadmin = async (ctx: Context) => {
+    const uid = ctx.from?.id;
+    if (!uid || !(await isBotAdmin(uid))) {
+      return ctx.reply('Нет прав.');
+    }
+    const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
+    const m = raw.trim().match(/^\/addadmin(?:@\S+)?\s+(\d+)\s+(.+)$/is);
+    if (!m) {
+      return ctx.reply(
+        'Формат: /addadmin 123456789 Иван Иванов\n' +
+          'Назначает роль admin: полное меню и все админ-команды. Пользователь может ещё не быть в базе — запись создаётся.',
+      );
+    }
+    const tg = parseInt(m[1]!, 10);
+    const name = m[2]!.trim();
+    if (Number.isNaN(tg) || !name) {
+      return ctx.reply('Проверьте числовой telegram id и ФИО после него.');
+    }
+    await setUser(tg, name, 'admin');
+    return ctx.reply(
+      `Ок. Пользователь ${tg} — admin, ${name}.\nПусть откроет бота и нажмёт /start.`,
+    );
+  };
+  bot.hears(/^\/addadmin(?:@\S+)?(?:\s+(.+))?$/is, handleAddadmin);
+  bot.command('addadmin', handleAddadmin);
+
   const handleEditmgr = async (ctx: Context) => {
     const uid = ctx.from?.id;
-    if (!uid || !isAdmin(uid)) {
+    if (!uid || !(await isBotAdmin(uid))) {
       return ctx.reply('Нет прав.');
     }
     const raw = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
@@ -1193,7 +1220,7 @@ async function main() {
     if (!uid) return;
     try {
       if (d.startsWith('adm_b:')) {
-        if (!isAdmin(uid)) {
+        if (!(await isBotAdmin(uid))) {
           await ctx.answerCbQuery('Нет прав', { show_alert: true });
           return;
         }
@@ -1987,15 +2014,15 @@ async function main() {
       return ctx.reply('Отдел задаёт админ: /setdept. Остальное — в разработке.');
     }
     if (text === '📤 Передачи (кто кому)') {
-      if (!isAdmin(uid)) return;
+      if (!(await isBotAdmin(uid))) return;
       return sendAdminTransfersReport(ctx, uid);
     }
     if (text === '📊 Сводка') {
-      if (!isAdmin(uid)) return;
+      if (!(await isBotAdmin(uid))) return;
       return sendAdminStatsSummary(ctx, uid);
     }
     if (text === '📌 Лиды (всего)') {
-      if (!isAdmin(uid)) return;
+      if (!(await isBotAdmin(uid))) return;
       return sendAdminLeadsDigest(ctx, uid);
     }
     if (text === '🕓 Напоминания') {
