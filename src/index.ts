@@ -134,7 +134,23 @@ function atzConfirmSummary(s: Session) {
 const DEFAULT_LEAD_PAYMENT = 'cash' as const;
 
 function leadNotifyBody(leadId: string, fio: string, phone: string, brand: string) {
-  return `🔔 Новый лид #${leadId}\n` + `ФИО: ${fio}\nТелефон: ${phone}\n` + `Бренд: ${brand}`;
+  return `🔔 Новый лид #${leadId}\nБренд заявки: ${brand}\nФИО: ${fio}\nТелефон: ${phone}`;
+}
+
+/** Сообщение менеджеру: бренд + кто ответственный (с id), чтобы не путать пулы по брендам. */
+async function formatManagerLeadMessage(
+  leadId: string,
+  fio: string,
+  phone: string,
+  brand: string,
+  assigneeTelegramId: number,
+): Promise<string> {
+  const who = await formatTelegramUserLabel(assigneeTelegramId);
+  return (
+    `${leadNotifyBody(leadId, fio, phone, brand)}\n\n` +
+    `👤 Ответственный в боте: ${who}\n` +
+    `Назначение: очередь по бренду «${brand}» или выбор клиента/АТЗ вручную.`
+  );
 }
 
 function buyConfirmKb() {
@@ -829,7 +845,7 @@ async function runSlaBot(bot: Telegraf) {
       try {
         await bot.telegram.sendMessage(
           (L as { assignedTo: number }).assignedTo,
-          `⏰ Напоминание: обработайте клиента\nЛид: ${(L as { fio: string }).fio}\n/lead_${L.id}`,
+          `⏰ Напоминание: обработайте клиента\nБренд: ${(L as { brand: string }).brand}\nЛид: ${(L as { fio: string }).fio}\n#${L.id}`,
         );
         await setSlaFlags(L.id, true, false);
       } catch { /* */ }
@@ -841,7 +857,7 @@ async function runSlaBot(bot: Telegraf) {
         try {
           await bot.telegram.sendMessage(
             rid,
-            `⚠️ Просроченный лид\nОтветственный: ${mgrLabel}\nКлиент: ${(L as { fio: string }).fio}\nОжидание: ${Math.round(age / 60000)} мин\n#${L.id}`,
+            `⚠️ Просроченный лид\nБренд: ${(L as { brand: string }).brand}\nОтветственный: ${mgrLabel}\nКлиент: ${(L as { fio: string }).fio}\nОжидание: ${Math.round(age / 60000)} мин\n#${L.id}`,
           );
         } catch { /* */ }
       }
@@ -1467,10 +1483,10 @@ async function main() {
         s.data = {};
         const label = await formatTelegramShortName(m);
         await ctx.editMessageText(
-          `✅ Заявка #${leadId} отправлена.\nОтветственный: ${label}\n` +
+          `✅ Заявка #${leadId} отправлена.\nБренд заявки: ${brand}\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand)}\n(онлайн Telegram)`;
+        const mgrText = `${await formatManagerLeadMessage(leadId, fio, phone, brand, m)}\n(источник: заявка из Telegram)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -1537,10 +1553,10 @@ async function main() {
         s.data = {};
         const label = await formatTelegramShortName(m);
         await ctx.editMessageText(
-          `✅ Заявка #${leadId} отправлена (автоочередь).\nОтветственный: ${label}\n` +
+          `✅ Заявка #${leadId} отправлена (автоочередь).\nБренд заявки: ${brand}\nОтветственный: ${label}\n` +
             `Через ~${config.customerSurveyMinutes} мин напишем короткий опрос.`,
         );
-        const mgrText = `${leadNotifyBody(leadId, fio, phone, brand)}\n(онлайн Telegram)`;
+        const mgrText = `${await formatManagerLeadMessage(leadId, fio, phone, brand, m)}\n(источник: заявка из Telegram, автоочередь)`;
         try {
           await ctx.telegram.sendMessage(m, mgrText, { reply_markup: leadActionsKb(leadId).reply_markup });
         } catch {
@@ -1775,8 +1791,10 @@ async function main() {
         sess(uid).key = 'idle';
         sess(uid).data = {};
         const label = await formatTelegramShortName(m);
-        await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}.\nОтветственный: ${label}`);
-        const text = leadNotifyBody(leadId, fio, phone, brand);
+        await ctx.editMessageText(
+          `✅ Клиент зарегистрирован, лид #${leadId}.\nБренд заявки: ${brand}\nОтветственный: ${label}`,
+        );
+        const text = await formatManagerLeadMessage(leadId, fio, phone, brand, m);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1845,8 +1863,10 @@ async function main() {
         sess(uid).data = {};
         const label = await formatTelegramShortName(m);
         const assignLabel = keepSelf ? 'закреплён за вами' : `ответственный: ${label}`;
-        await ctx.editMessageText(`✅ Клиент зарегистрирован, лид #${leadId}. ${assignLabel}.`);
-        const text = leadNotifyBody(leadId, fio, phone, brand);
+        await ctx.editMessageText(
+          `✅ Клиент зарегистрирован, лид #${leadId}.\nБренд заявки: ${brand}. ${assignLabel}.`,
+        );
+        const text = await formatManagerLeadMessage(leadId, fio, phone, brand, m);
         if (m !== uid) {
           try {
             const kb = leadActionsKb(leadId);
@@ -1958,8 +1978,10 @@ async function main() {
         const newLabel = await formatTelegramShortName(r.newManager);
         await ctx.reply(`✅ Клиент передан. Ответственный: ${newLabel}`);
         const fromName = await formatTelegramShortName(uid);
+        const leadSnap = await getLead(String(s.data.leadId));
+        const brandLine = leadSnap?.brand ? `Бренд заявки: ${leadSnap.brand}\n` : '';
         const msg =
-          `🔄 Вам передан лид #${s.data.leadId}\n` + `От: ${fromName}\n` + `Комментарий: ${text}`;
+          `🔄 Вам передан лид #${s.data.leadId}\n${brandLine}` + `От: ${fromName}\n` + `Комментарий: ${text}`;
         try {
           const kb = leadActionsKb(String(s.data.leadId));
           await ctx.telegram.sendMessage(r.newManager, msg, { reply_markup: kb.reply_markup });
@@ -2006,7 +2028,7 @@ async function main() {
       const list = await listMyLeads(uid);
       if (list.length === 0) return ctx.reply('Пока пусто');
       const body = list
-        .map((L, i) => `${i + 1}. ${L.fio} — ${L.status} (${L.brand}) #${L.id}`)
+        .map((L, i) => `${i + 1}. #${L.id} | ${L.brand} | ${L.fio} — ${L.status}`)
         .join('\n');
       return ctx.reply(body);
     }
